@@ -209,8 +209,9 @@ static void launch_app(video_renderer_webos_t *r) {
     }
     snprintf(payload, sizeof(payload),
              "{\"id\":\"" APP_ID "\",\"params\":{\"udpPort\":%d,\"width\":%d,\"height\":%d,\"framerate\":30,"
-             "\"audioCodec\":\"AAC\",\"audioRate\":%d,\"audioChannels\":%d}}",
-             UDP_PORT, r->width, r->height, WEBOS_AUDIO_RATE, WEBOS_AUDIO_CHANNELS);
+             "\"audioCodec\":\"%s\",\"audioRate\":%d,\"audioChannels\":%d,\"clock\":%s}}",
+             UDP_PORT, r->width, r->height, r->audio_appsrc ? "AAC" : "none",
+             WEBOS_AUDIO_RATE, WEBOS_AUDIO_CHANNELS, getenv("RPIPLAY_LATENCY_TEST") ? "true" : "false");
     luna_send("luna://com.webos.applicationManager/launch", payload);
     r->app_launched = 1;
     r->tv_ready = 0;
@@ -402,7 +403,7 @@ static void log_stats(video_renderer_webos_t *r, time_t now) {
     if (now - r->last_stats < STATS_SECONDS) return;
     guint64 vq = 0, aq = 0;
     g_object_get(r->appsrc, "current-level-bytes", &vq, NULL);
-    g_object_get(r->audio_appsrc, "current-level-bytes", &aq, NULL);
+    if (r->audio_appsrc) g_object_get(r->audio_appsrc, "current-level-bytes", &aq, NULL);
     udp_socket_t s;
     udp_port_scan(r->stale_inode, &s);
     printf("[webos-stats] %lds: video %u frames, queued %llu B | audio %u frames, queued %llu B"
@@ -603,12 +604,28 @@ static void url_decode(char *s) {
     *out = 0;
 }
 
+static void send_http(int c, const char *type, const char *body, int len) {
+    char head[256];
+    int n = snprintf(head, sizeof(head),
+                     "HTTP/1.0 200 OK\r\nContent-Type: %s\r\nContent-Length: %d\r\n"
+                     "Access-Control-Allow-Origin: *\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+                     type, len);
+    send(c, head, n, 0);
+    send(c, body, len, 0);
+}
+
+/* Debug: with RPIPLAY_LATENCY_TEST=<path of clock.html> the server also
+ * listens on the network, serving that page at /clock and this process's
+ * clock (ms) at /time. The phone mirrors the page, which shows our clock;
+ * the app overlays the same clock (launch param "clock"), so a display
+ * capture shows the latency as the difference of the two readings. */
 static void *app_event_thread(void *arg) {
     video_renderer_webos_t *r = arg;
+    const char *latency_test = getenv("RPIPLAY_LATENCY_TEST");
     int srv = socket(AF_INET, SOCK_STREAM, 0);
     int one = 1;
     struct sockaddr_in addr = { .sin_family = AF_INET, .sin_port = htons(APP_EVENT_PORT) };
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_addr.s_addr = htonl(latency_test ? INADDR_ANY : INADDR_LOOPBACK);
     setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
     if (srv < 0 || bind(srv, (struct sockaddr *)&addr, sizeof(addr)) < 0 || listen(srv, 8) < 0) {
         printf("[webos-app] can't listen on %d for app events\n", APP_EVENT_PORT);
@@ -620,16 +637,37 @@ static void *app_event_thread(void *arg) {
         if (c < 0) continue;
         char req[2048];
         int n = recv(c, req, sizeof(req) - 1, 0);
-        static const char reply[] = "HTTP/1.0 204 No Content\r\nConnection: close\r\n\r\n";
-        send(c, reply, sizeof(reply) - 1, 0);
-        close(c);
-        if (n <= 0) continue;
+        if (n <= 0) {
+            close(c);
+            continue;
+        }
         req[n] = 0;
         /* "GET /<message>?<seq> HTTP/1.1" */
         char *msg = strchr(req, '/');
-        if (!msg || strncmp(req, "GET ", 4) != 0) continue;
+        if (!msg || strncmp(req, "GET ", 4) != 0) {
+            close(c);
+            continue;
+        }
         msg++;
         msg[strcspn(msg, "? \r\n")] = 0;
+        if (latency_test && !strcmp(msg, "time")) {
+            char body[32];
+            send_http(c, "text/plain", body, snprintf(body, sizeof(body), "%lld", now_ms()));
+            close(c);
+            continue;
+        }
+        if (latency_test && !strcmp(msg, "clock")) {
+            static char page[65536];
+            FILE *f = fopen(latency_test, "r");
+            int len = f ? (int)fread(page, 1, sizeof(page), f) : 0;
+            if (f) fclose(f);
+            send_http(c, "text/html", page, len);
+            close(c);
+            continue;
+        }
+        static const char reply[] = "HTTP/1.0 204 No Content\r\nConnection: close\r\n\r\n";
+        send(c, reply, sizeof(reply) - 1, 0);
+        close(c);
         url_decode(msg);
         pthread_mutex_lock(&r->lock);
         long long now = now_ms(), since = now - r->launch_ms, after_prime = -1;
@@ -680,15 +718,19 @@ video_renderer_t *video_renderer_gstreamer_init(logger_t *logger, video_renderer
     renderer->base.type = VIDEO_RENDERER_GSTREAMER;
     pthread_mutex_init(&renderer->lock, NULL);
 
+    /* Debug: RPIPLAY_NO_AUDIO leaves audio out of the stream and the player,
+     * to measure what the TV's A/V sync costs in latency */
+    int no_audio = getenv("RPIPLAY_NO_AUDIO") != NULL;
     char launch[768];
     snprintf(launch, sizeof(launch),
              "appsrc name=video_source is-live=true format=time stream-type=0 ! "
              "h264parse config-interval=1 ! "
-             "video/x-h264,stream-format=byte-stream,alignment=au ! mux. "
-             "appsrc name=audio_source is-live=true format=time stream-type=0 ! "
-             "aacparse ! mux. "
+             "video/x-h264,stream-format=byte-stream,alignment=au ! mux. %s"
              "mpegtsmux name=mux ! rtpmp2tpay ! "
-             "appsink name=rtp_sink sync=false async=false");
+             "appsink name=rtp_sink sync=false async=false",
+             no_audio ? "" :
+             "appsrc name=audio_source is-live=true format=time stream-type=0 ! "
+             "aacparse ! mux. ");
     printf("[webos-video] pipeline: %s\n", launch);
     renderer->pipeline = gst_parse_launch(launch, &error);
     if (error) {
@@ -708,14 +750,16 @@ video_renderer_t *video_renderer_gstreamer_init(logger_t *logger, video_renderer
     gst_caps_unref(caps);
 
     renderer->audio_appsrc = gst_bin_get_by_name(GST_BIN(renderer->pipeline), "audio_source");
-    caps = gst_caps_new_simple("audio/mpeg",
-        "mpegversion", G_TYPE_INT, 4,
-        "stream-format", G_TYPE_STRING, "adts",
-        "rate", G_TYPE_INT, WEBOS_AUDIO_RATE,
-        "channels", G_TYPE_INT, WEBOS_AUDIO_CHANNELS,
-        NULL);
-    g_object_set(renderer->audio_appsrc, "caps", caps, NULL);
-    gst_caps_unref(caps);
+    if (renderer->audio_appsrc) {
+        caps = gst_caps_new_simple("audio/mpeg",
+            "mpegversion", G_TYPE_INT, 4,
+            "stream-format", G_TYPE_STRING, "adts",
+            "rate", G_TYPE_INT, WEBOS_AUDIO_RATE,
+            "channels", G_TYPE_INT, WEBOS_AUDIO_CHANNELS,
+            NULL);
+        g_object_set(renderer->audio_appsrc, "caps", caps, NULL);
+        gst_caps_unref(caps);
+    }
 
     renderer->udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
     struct sockaddr_in tv = { .sin_family = AF_INET, .sin_port = htons(UDP_PORT) };
@@ -852,7 +896,7 @@ static void video_renderer_webos_render_buffer(video_renderer_t *renderer, raop_
 void video_renderer_webos_push_audio(video_renderer_t *renderer, const unsigned char *adts, int len) {
     video_renderer_webos_t *r = (video_renderer_webos_t *)renderer;
     pthread_mutex_lock(&r->lock);
-    int streaming = r->tv_ready;
+    int streaming = r->tv_ready && r->audio_appsrc;
     if (streaming) r->audio_pushed++;
     pthread_mutex_unlock(&r->lock);
     if (!streaming) return;

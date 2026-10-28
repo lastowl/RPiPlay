@@ -46,6 +46,11 @@ mv $REMOTE_DIR/rpiplay.new $REMOTE_DIR/rpiplay
 chmod 755 $REMOTE_DIR/rpiplay
 # Debug: RPIPLAY_DUMP_DIR=/tmp/rpdump ./tv-run.sh saves the H.264 sent after each rotation
 ${RPIPLAY_DUMP_DIR:+rm -rf $RPIPLAY_DUMP_DIR; mkdir -p $RPIPLAY_DUMP_DIR; export RPIPLAY_DUMP_DIR=$RPIPLAY_DUMP_DIR}
+# Debug: RPIPLAY_NO_AUDIO=1 ./tv-run.sh streams video only (latency comparison)
+${RPIPLAY_NO_AUDIO:+export RPIPLAY_NO_AUDIO=1}
+# Debug: RPIPLAY_LATENCY_TEST=1 ./tv-run.sh serves a clock page at http://<tv>:7737/clock
+# for the phone to mirror and overlays the same clock on the TV (see video_renderer_webos.c)
+${RPIPLAY_LATENCY_TEST:+export RPIPLAY_LATENCY_TEST=$APP_DIR/clock.html}
 ${RPIPLAY_ARGS:+export RPIPLAY_ARGS="$RPIPLAY_ARGS"}
 $START
 sleep 2

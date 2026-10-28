@@ -42,7 +42,54 @@ function report(msg) {
 }
 
 var DEFAULTS = { udpPort: 5000, width: 1920, height: 1080, framerate: 30, lowLatency: true,
-                 audioCodec: "AAC", audioRate: 48000, audioChannels: 2, testFile: "" };
+                 audioCodec: "AAC", audioRate: 48000, audioChannels: 2, testFile: "", clock: false };
+
+/* Latency test (launch param "clock": true): overlay RPiPlay's clock, read
+ * from http://127.0.0.1:EVENT_PORT/time, in the top left corner. The phone
+ * mirrors the same clock (served at /clock), so a display capture shows the
+ * latency as the difference between the two readings. */
+var tick = (window.performance && performance.now) ?
+    function () { return performance.now(); } : function () { return Date.now(); };
+
+function pad3(n) { return ("00" + Math.floor(n)).slice(-3); }
+
+/* Offset from tick() to the server's clock, from the lowest-latency of 10 requests */
+function syncClock(url, done) {
+    var samples = [], n = 0;
+    (function one() {
+        var x = new XMLHttpRequest(), t0 = tick();
+        x.open("GET", url + "?" + n, true);
+        x.onload = function () {
+            var t1 = tick();
+            samples.push({ rtt: t1 - t0, off: parseFloat(x.responseText) - (t0 + t1) / 2 });
+            if (++n < 10) { one(); return; }
+            samples.sort(function (a, b) { return a.rtt - b.rtt; });
+            done(samples[0].off, samples[0].rtt);
+        };
+        x.onerror = function () { done(null, 0); };
+        x.send();
+    })();
+}
+
+function showClock() {
+    var div = document.getElementById("clock");
+    if (div) return;
+    div = document.createElement("div");
+    div.id = "clock";
+    div.style.cssText = "position:absolute;left:0;top:0;z-index:10;padding:10px 30px;" +
+        "font:bold 110px monospace;color:#fff;background:rgba(0,0,0,0.6)";
+    div.textContent = "sync...";
+    document.body.appendChild(div);
+    syncClock("http://127.0.0.1:" + EVENT_PORT + "/time", function (off, rtt) {
+        if (off === null) { div.textContent = "no sync"; return; }
+        report("clock synced, rtt " + rtt.toFixed(1) + " ms");
+        (function frame() {
+            var t = tick() + off;
+            div.textContent = pad3((t / 1000) % 1000) + "." + pad3(t % 1000);
+            requestAnimationFrame(frame);
+        })();
+    });
+}
 
 function readParams() {
     var p = {};
@@ -124,6 +171,7 @@ function startPlayer() {
     document.body.appendChild(video);
     video.load();
     report("player created " + p.width + "x" + p.height);
+    if (p.clock) showClock();
 }
 
 document.addEventListener("webOSRelaunch", startPlayer, true);

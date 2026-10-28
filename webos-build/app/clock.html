@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<style>
+html, body { margin: 0; background: #000; color: #fff; overflow: hidden; }
+#s, #m { font: bold 30vw/1.1 monospace; text-align: center; }
+#s { margin-top: 15vh; }
+#r { margin-top: 5vh; font: 5vw sans-serif; color: #888; text-align: center; }
+</style>
+</head>
+<body>
+<div id="s">---</div>
+<div id="m">---</div>
+<div id="r">syncing...</div>
+<script>
+/*
+ * Latency test page, served by RPiPlay at http://<tv>:7737/clock when it
+ * runs with RPIPLAY_LATENCY_TEST. Mirror this page from the phone: it shows
+ * RPiPlay's clock (seconds, then milliseconds), synced from /time. The
+ * player app overlays the same clock, so a display capture of the TV shows
+ * the latency as the difference between the two readings.
+ */
+var tick = (window.performance && performance.now) ?
+    function () { return performance.now(); } : function () { return Date.now(); };
+
+function pad3(n) { return ("00" + Math.floor(n)).slice(-3); }
+
+function syncClock(url, done) {
+    var samples = [], n = 0;
+    (function one() {
+        var x = new XMLHttpRequest(), t0 = tick();
+        x.open("GET", url + "?" + n, true);
+        x.onload = function () {
+            var t1 = tick();
+            samples.push({ rtt: t1 - t0, off: parseFloat(x.responseText) - (t0 + t1) / 2 });
+            if (++n < 10) { one(); return; }
+            samples.sort(function (a, b) { return a.rtt - b.rtt; });
+            done(samples[0].off, samples[0].rtt);
+        };
+        x.onerror = function () { done(null, 0); };
+        x.send();
+    })();
+}
+
+var s = document.getElementById("s"), m = document.getElementById("m"), r = document.getElementById("r");
+syncClock("/time", function (off, rtt) {
+    if (off === null) { r.textContent = "sync failed"; return; }
+    r.textContent = "synced, rtt " + rtt.toFixed(1) + " ms";
+    (function frame() {
+        var t = tick() + off;
+        s.textContent = pad3((t / 1000) % 1000);
+        m.textContent = pad3(t % 1000);
+        requestAnimationFrame(frame);
+    })();
+});
+</script>
+</body>
+</html>

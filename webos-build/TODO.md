@@ -24,25 +24,83 @@ through the TV's Miracast media pipeline (`miracast://` video source).
   - The slider doesn't follow the TV remote (that would need DACP), so the
     two can drift apart; pushing the slider to either end lines them up.
 
+## Performance (measured 2026-10-28)
+
+- CPU: RPiPlay ~20% of one core (the TV has four), the TV's media pipeline
+  ~29%. Inside RPiPlay no thread is above 4%. Not a concern.
+- Delay from the phone's screen to the TV's composited picture, measured
+  with the latency test below: **~50 ms with audio** (41-59 over six
+  captures), **~24 ms video only** (16-30). Audio costs ~27 ms: mpegtsmux
+  lets a video frame out only once an audio frame (one every 23 ms) is
+  queued too, and the TV's A/V sync then holds video for the audio path's
+  latency.
+- The TV's demuxer holds each frame until the next one starts, one more
+  frame period: mpegtsmux writes video PES packets with length 0, while
+  tsdemux (1.2.4, `gst_ts_demux_handle_packet`) pushes a PES as soon as its
+  stated length is complete. Mirrored frames are 3-16 KB, far below the
+  64 KB a PES length can state. Our own TS muxer would remove this and the
+  audio wait, and is also what the lone IDR after a rotation needs.
+- What the TV's picture processing adds after the capture point can't be
+  measured this way; Game picture mode / TruMotion off would reduce it.
+- `TV_SETTLE_MS` (1000) and restart time could still be tuned down.
+
+### Latency test
+
+`RPIPLAY_LATENCY_TEST=1 ./webos-build/tv-run.sh` makes RPiPlay serve
+`app/clock.html` at `http://<tv>:7737/clock` and the player app overlay the
+same clock (RPiPlay's, read from `/time`). Mirror that page from the phone,
+then capture the TV's display: `luna://com.webos.service.tv.capture/
+executeOneShot` with `{"method":"SCREEN","format":"JPEG","width":1920,
+"height":1080,"path":...}` (~0.2 s each). Each capture shows both clocks;
+the difference is the delay. `RPIPLAY_NO_AUDIO=1` streams video only.
+
 ## Open issues
 
-1. **Performance**
-   - Measure end-to-end latency and CPU; check `displayQueueSize`, jitter
-     buffer latency in the Miracast pipeline, GOP replay cost.
-   - `TV_SETTLE_MS` (1000) and restart time could be tuned down.
+1. **Running on other LG TVs** (research 2026-10-28)
+   - Audience: TVs without built-in AirPlay 2, i.e. 2014-2018 sets (webOS
+     1.x-4.0; AirPlay 2 came with webOS 4.5 and was back-ported to some
+     webOS 4.0 models). Root today: webOS 3.5-4.x via DejaVuln/faultmanager
+     (throwaway96); webOS 1.x-3.4 have had no software root since early 2024
+     (hardware NVM mod only); RootMyTV never covered <3.4. So requiring root
+     excludes most of the audience: developer mode (no root) is essential.
+   - Dev mode runs native binaries: `/usr/bin/jailer -t native_devmode -i
+     <id> -p <appdir> <binary>` (webosbrew.org/pages/native-development);
+     moonlight-tv is a native app installable without root on webOS 1.x-5.x+.
+     Dev mode sessions last 1000 h and need renewing from the Dev Mode app.
+   - The `miracast://` web-app path is LG-internal and unverified on any
+     other version (LG documents only HTTP/HLS transports). The portable
+     low-latency path used by moonlight-tv and Kodi feeds the H.264
+     elementary stream straight into LG's player library
+     (`libplayerAPIs`, StarfishMediaAPIs `Load`/`Feed`, BUFFERSTREAM with
+     `contentsType WEBRTC/LIVE`, `lowDelayMode`): two ABI variants, "acb"
+     for webOS 2-4.x and "webos5" for 5+ (github.com/webosbrew/samples,
+     media/smp), plus LGNC (`liblgncopenapi`) on webOS 1-4. That needs no
+     MPEG-TS/RTP/UDP, no web app, no luna-send and none of the TV's
+     GStreamer (1.2.4 here, 1.14 on webOS 5, 1.24 on webOS 25).
+   - Toolchain: the community builds with buildroot-nc4 /
+     `webosbrew/native-toolchain` (`arm-webos-linux-gnueabi`, Cortex-A9
+     softfp, a patched glibc 2.12 plus polyfills, kernel headers 3.10) and
+     one armv7 binary covers webOS 1.x to 26; userland is 32-bit ARM on
+     every LG TV, including 64-bit SoCs. It replaces our Docker toolchain
+     linked against glibc 2.19 pulled from this TV.
+   - Volume without root: apps may only call `com.webos.audio`
+     setMuted/volumeUp/volumeDown; `setVolume`/`getVolume` as used here may
+     be refused. The LAN WebSocket API (`ws://<tv>:3000`, one pairing
+     prompt, `ssap://audio/setVolume`, `getVolume`) works on every version.
+   - Rooted TVs: Homebrew Channel runs `/var/lib/webosbrew/init.d` scripts
+     as root at boot (reliable from webOS 4.5; older needs HBChannel's
+     Aug 2026 autostart fix or `webosbrew-autostart`); hyperion.ng-webos-
+     loader is the model for a root daemon packaged as an HBChannel app.
+   - Proposed order: (1) prove the direct-feed player on this TV from dev
+     mode with webosbrew's smp sample; (2) if it works, make RPiPlay a
+     native app with that output, keep the Miracast path as the rooted
+     fallback; (3) switch to the webosbrew toolchain; (4) volume via the
+     WebSocket API.
 
 2. **Packaging for others**
    - Clean repo layout, build instructions, prebuilt ipk + binary.
    - ~~Startup at boot~~ (done — `boot-root.sh` → `rpiplay-start.sh`).
    - Remove leftovers: `gst_preload.c` unused; `HANDOVER-lite.md` partly wrong.
-
-3. **Root and non-root (developer mode) support**
-   - Root is needed today only because `luna-send` (app launch/close) doesn't
-     work inside the dev-mode jail.
-   - Investigate: a dev-mode app with a native/JS service can call luna APIs
-     with the app's own permissions; RPiPlay could run as that service, or
-     the app could launch/close itself on a signal from RPiPlay. Also check
-     whether the jail allows binding the AirPlay ports and mDNS (5353).
 
 ## Rotation notes
 
