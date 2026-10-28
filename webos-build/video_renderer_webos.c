@@ -24,6 +24,7 @@
 #include <string.h>
 #include <time.h>
 #include <pthread.h>
+#include <dirent.h>
 
 #define APP_ID "com.rpiplay.airplay"
 #define UDP_PORT 5000
@@ -41,10 +42,11 @@
  * seconds of stale video. */
 #define GOP_MAX_BUFFERS 600
 #define GOP_MAX_BYTES (8 * 1024 * 1024)
-#define TV_SETTLE_MS 2000
+#define TV_SETTLE_MS 1000
 #define TV_READY_POLL_MS 100
 #define TV_READY_TIMEOUT_SECONDS 10
 #define STATS_SECONDS 5
+#define PIPELINE_EXIT_TIMEOUT_MS 5000
 
 static volatile sig_atomic_t prime_requested = 0;
 
@@ -92,15 +94,16 @@ typedef struct video_renderer_webos_s {
     int tv_ready;              /* TV pipeline bound to UDP_PORT and settled */
     long long launch_ms;       /* when the app was last (re)launched */
     long long bound_ms;        /* when the port was first seen bound, 0 if not yet */
-    unsigned long tv_inode;    /* socket inode of the TV pipeline we stream to */
-    unsigned long stale_inode; /* pipeline being replaced; not "ready" */
+    unsigned long stale_inode; /* socket of the pipeline being replaced */
+    int restart_pending;       /* size changed while a pipeline was starting */
     long long last_ready_check;
 
     /* Stats, logged every STATS_SECONDS while streaming */
     time_t last_stats;
     unsigned video_pushed, audio_pushed;
 
-    int width, height;         /* stream size the TV player was launched with */
+    int width, height;         /* size the TV player is launched with */
+    int stream_width, stream_height; /* current H.264 picture size */
     GstBuffer *sps_pps;        /* last codec config (frame_type 0) */
     GstBuffer *gop[GOP_MAX_BUFFERS];
     int gop_count;
@@ -145,6 +148,7 @@ static void launch_app(video_renderer_webos_t *r) {
     luna_send("luna://com.webos.applicationManager/launch", payload);
     r->app_launched = 1;
     r->tv_ready = 0;
+    r->restart_pending = 0;
     r->launch_ms = now_ms();
     r->bound_ms = 0;
     r->stale_inode = 0;
@@ -154,15 +158,42 @@ static void launch_app(video_renderer_webos_t *r) {
 static int udp_port_bound(void);
 static unsigned long udp_port_inode(void);
 
+/* umediaserver runs each media pipeline as its own process */
+static int media_pipeline_running(void) {
+    DIR *proc = opendir("/proc");
+    struct dirent *e;
+    int found = 0;
+    if (!proc) return 0;
+    while (!found && (e = readdir(proc)) != NULL) {
+        char path[64], cmd[64];
+        if (e->d_name[0] < '1' || e->d_name[0] > '9') continue;
+        snprintf(path, sizeof(path), "/proc/%s/cmdline", e->d_name);
+        FILE *f = fopen(path, "r");
+        if (!f) continue;
+        size_t n = fread(cmd, 1, sizeof(cmd) - 1, f);
+        fclose(f);
+        cmd[n] = 0;
+        if (strstr(cmd, "starfish-media-pipeline")) found = 1;
+    }
+    closedir(proc);
+    return found;
+}
+
 static void close_app(video_renderer_webos_t *r) {
     luna_send("luna://com.webos.applicationManager/closeByAppId", "{\"id\":\"" APP_ID "\"}");
     r->app_launched = 0;
     r->tv_ready = 0;
     r->bound_ms = 0;
-    /* Wait for the old pipeline to release the port so the next session
-     * doesn't mistake it for its own */
-    for (int i = 0; i < 30 && udp_port_bound(); i++)
-        usleep(100000);
+    /* Wait for the old pipeline process to exit, releasing the port and the
+     * TV's video decoder. A new pipeline started while the old one still
+     * held the decoder stayed black. */
+    long long start = now_ms();
+    while ((udp_port_bound() || media_pipeline_running()) &&
+           now_ms() - start < PIPELINE_EXIT_TIMEOUT_MS)
+        usleep(50000);
+    printf("[webos-video] old pipeline gone after %lld ms%s\n", now_ms() - start,
+           media_pipeline_running() ? " (timed out, still running)" : "");
+    fflush(stdout);
 }
 
 /* The Miracast pipeline binds 0.0.0.0:UDP_PORT once the app's <video> loads.
@@ -198,7 +229,6 @@ static void check_ready(video_renderer_webos_t *r, long long now) {
                UDP_PORT, now - r->launch_ms);
         fflush(stdout);
         r->bound_ms = now;
-        r->tv_inode = inode;
     }
     if (r->bound_ms && now - r->bound_ms >= TV_SETTLE_MS) {
         printf("[webos-video] TV pipeline ready (%lld ms after launch)\n", now - r->launch_ms);
@@ -208,13 +238,18 @@ static void check_ready(video_renderer_webos_t *r, long long now) {
 }
 
 /* The TV's Miracast decoder can't follow a resolution change (rotation), so
- * relaunch the app: its webOSRelaunch handler replaces the <video>, giving a
- * fresh pipeline. Frames are cached until that one is ready, then primed.
- * Call with the lock held. */
+ * close and relaunch the app for a fresh pipeline. Just relaunching (its
+ * webOSRelaunch handler replaces the <video>) is faster, but quick repeated
+ * relaunches left the TV's media pipeline stuck on black until the app was
+ * closed. Frames are cached until the new pipeline is ready, then primed.
+ * Call with the lock held; blocks while the old pipeline shuts down. */
 static void restart_tv_pipeline(video_renderer_webos_t *r) {
     printf("[webos-video] restarting TV pipeline\n");
     fflush(stdout);
-    unsigned long old_inode = r->tv_inode;
+    close_app(r);
+    /* close_app gives up after 5 s; don't mistake a lingering old pipeline
+     * for the new one */
+    unsigned long old_inode = udp_port_inode();
     launch_app(r);
     r->stale_inode = old_inode;
 }
@@ -473,24 +508,25 @@ static void video_renderer_webos_render_buffer(video_renderer_t *renderer, raop_
     if (type == 0) {
         if (r->sps_pps) gst_buffer_unref(r->sps_pps);
         r->sps_pps = cached;
-        /* The TV player shows nothing if launched with the wrong size, and
-         * can't follow a size change. Found by testing on the 49UF850V:
-         * landscape needs its exact size, while portrait only works when
-         * the player is launched as 1920x1080. */
+        /* The TV player can't follow a picture size change (rotation), so
+         * give it a fresh pipeline. It is always launched as 1920x1080. */
         int w, h;
         if (sps_size(data, data_len, &w, &h)) {
-            if (h > w) {
-                w = 1920;
-                h = 1080;
-            }
-            if (w != r->width || h != r->height) {
-                printf("[webos-video] stream size changed, player %dx%d -> %dx%d\n",
-                       r->width, r->height, w, h);
+            if (w != r->stream_width || h != r->stream_height) {
+                printf("[webos-video] stream size %dx%d -> %dx%d\n",
+                       r->stream_width, r->stream_height, w, h);
                 fflush(stdout);
-                r->width = w;
-                r->height = h;
-                if (r->app_launched)
-                    restart_tv_pipeline(r);
+                int was_streaming = r->stream_width != 0;
+                r->stream_width = w;
+                r->stream_height = h;
+                /* One restart at a time: overlapping ones left the TV's
+                 * decoder stuck on black */
+                if (was_streaming && r->app_launched) {
+                    if (r->tv_ready)
+                        restart_tv_pipeline(r);
+                    else
+                        r->restart_pending = 1;
+                }
             }
         }
     } else {
@@ -507,8 +543,11 @@ static void video_renderer_webos_render_buffer(video_renderer_t *renderer, raop_
             r->last_ready_check = now;
             check_ready(r, now);
         }
-        /* Became ready mid-stream: the current frame is already in the GOP */
-        if (r->tv_ready)
+        /* Became ready mid-stream: the current frame is already in the GOP.
+         * If the picture size changed while it started, restart again. */
+        if (r->tv_ready && r->restart_pending)
+            restart_tv_pipeline(r);
+        else if (r->tv_ready)
             prime(r);
     } else if (prime_requested) {
         prime_requested = 0;
@@ -584,7 +623,7 @@ void video_renderer_webos_update_background(video_renderer_t *renderer, int type
         if (r->connections == 0) {
             if (r->app_launched) close_app(r);
             gop_clear(r);
-            r->width = r->height = 0;
+            r->stream_width = r->stream_height = 0;
             if (r->sps_pps) {
                 gst_buffer_unref(r->sps_pps);
                 r->sps_pps = NULL;
