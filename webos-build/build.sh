@@ -88,9 +88,30 @@ echo "  renderers..."
 $CC $CFLAGS $DEFS $INC -c /src/renderers/video_renderer_dummy.c -o $WORKDIR/obj/video_renderer_dummy.o
 $CC $CFLAGS $DEFS $INC -c /src/renderers/audio_renderer_dummy.c -o $WORKDIR/obj/audio_renderer_dummy.o
 
+# fdk-aac (AAC-ELD decode + AAC-LC encode for the audio renderer).
+# Sources never change, so objects are cached in the output dir.
+FDK=/src/renderers/fdk-aac
+FDK_INC=""
+for d in $FDK/lib*/include; do FDK_INC="$FDK_INC -I$d"; done
+FDK_CACHE=/output/.fdk-obj
+if [ ! -f $FDK_CACHE/.done ]; then
+    echo "  fdk-aac (first build, cached afterwards)..."
+    mkdir -p $FDK_CACHE
+    n=0
+    for f in $FDK/lib*/src/*.cpp; do
+        o=$FDK_CACHE/fdk_$(basename $(dirname $(dirname $f)))_$(basename ${f%.cpp}).o
+        $CXX $CXXFLAGS -fno-exceptions -fno-rtti $FDK_INC -c "$f" -o "$o" &
+        n=$((n+1))
+        [ $((n % 8)) -eq 0 ] && wait
+    done
+    wait
+    touch $FDK_CACHE/.done
+fi
+cp $FDK_CACHE/*.o $WORKDIR/obj/
+
 echo "  webos renderers..."
-$CC $CFLAGS $DEFS $INC -c /webos/video_renderer_webos.c -o $WORKDIR/obj/video_renderer_webos.o
-$CC $CFLAGS $DEFS $INC -c /webos/audio_renderer_webos.c -o $WORKDIR/obj/audio_renderer_webos.o
+$CC $CFLAGS $DEFS $INC -I/webos -c /webos/video_renderer_webos.c -o $WORKDIR/obj/video_renderer_webos.o
+$CC $CFLAGS $DEFS $INC -I/webos $FDK_INC -c /webos/audio_renderer_webos.c -o $WORKDIR/obj/audio_renderer_webos.o
 
 # Compile glibc compat shims (getentropy, explicit_bzero for glibc <2.25)
 echo "  glibc compat shims..."

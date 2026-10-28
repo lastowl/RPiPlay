@@ -6,6 +6,5 @@
     "main": "index.html",
     "title": "AirPlay Mirror",
     "icon": "icon.png",
-    "transparent": true,
     "handlesRelaunch": true
 }

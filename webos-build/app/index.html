@@ -27,9 +27,12 @@ video {
  * so umediaserver and the compositor handle the video plane for us.
  *
  * Launch params (all optional):
- *   {"udpPort":5000, "width":1920, "height":1080, "framerate":30, "lowLatency":true}
+ *   {"udpPort":5000, "width":1920, "height":1080, "framerate":30, "lowLatency":true,
+ *    "audioCodec":"AAC", "audioRate":48000, "audioChannels":2}
+ * audioCodec "none" leaves audio out of the mediaOption.
  */
-var DEFAULTS = { udpPort: 5000, width: 1920, height: 1080, framerate: 30, lowLatency: true };
+var DEFAULTS = { udpPort: 5000, width: 1920, height: 1080, framerate: 30, lowLatency: true,
+                 audioCodec: "AAC", audioRate: 48000, audioChannels: 2, testFile: "" };
 
 function readParams() {
     var p = {};
@@ -70,13 +73,28 @@ function startPlayer() {
             }
         }
     };
+    if (p.audioCodec !== "none") {
+        option.option.transmission.miracastInfo.audio = {
+            codec: p.audioCodec,
+            frequency: p.audioRate,
+            channels: p.audioChannels,
+            bitWidth: 16
+        };
+    }
 
     var video = document.createElement("video");
     video.id = "player";
     video.autoplay = true;
+    video.loop = !!p.testFile;
     var source = document.createElement("source");
-    source.src = "miracast://miracast";
-    source.type = "video/mp4; mediaOption=" + escape(JSON.stringify(option));
+    if (p.testFile) {
+        /* Debug: plain file playback, e.g. {"testFile":"file:///path/clip.mp4"} */
+        source.src = p.testFile;
+        source.type = "video/mp4";
+    } else {
+        source.src = "miracast://miracast";
+        source.type = "video/mp4; mediaOption=" + escape(JSON.stringify(option));
+    }
     video.appendChild(source);
     video.addEventListener("error", function () {
         console.log("[airplay] video error " + (video.error && video.error.code));

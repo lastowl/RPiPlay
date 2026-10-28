@@ -12,6 +12,7 @@
  */
 
 #include "video_renderer.h"
+#include "webos_av.h"
 #include <assert.h>
 #include <stdlib.h>
 #include <gst/gst.h>
@@ -28,15 +29,22 @@
 #define UDP_PORT 5000
 
 /* iOS sends an IDR only when mirroring starts (or the picture changes a
- * lot), and the TV's decoder may not be running yet when it arrives. So the
- * codec config and every frame since the last IDR are always kept, and
- * replayed ("primed") into the TV pipeline once it is listening and again a
- * few seconds later. Replaying restarts the decoder at the keyframe and ends
- * on the same reference frames the live stream continues from. */
+ * lot), so the TV decoder must be running before the stream begins. On a new
+ * connection we launch the app and hold the connection (conn_init runs on
+ * the RAOP HTTP thread, so iOS just waits) until the TV pipeline has bound
+ * its port and had TV_SETTLE_MS to start up.
+ *
+ * As a fallback for streams that start anyway, the codec config and every
+ * frame since the last IDR are kept and replayed ("primed") once when the TV
+ * becomes ready. Replays are kept to that one: with an audio track the TV
+ * plays every replayed frame in A/V sync mode, so repeated replays queue up
+ * seconds of stale video. */
 #define GOP_MAX_BUFFERS 600
 #define GOP_MAX_BYTES (8 * 1024 * 1024)
-static const int prime_delays[] = { 0, 2, 5 };   /* seconds after the port is bound */
-#define PRIME_COUNT (int)(sizeof(prime_delays) / sizeof(prime_delays[0]))
+#define TV_SETTLE_MS 2000
+#define TV_READY_POLL_MS 100
+#define TV_READY_TIMEOUT_SECONDS 10
+#define STATS_SECONDS 5
 
 static volatile sig_atomic_t prime_requested = 0;
 
@@ -75,16 +83,24 @@ static void term_handler(int sig) {
 
 typedef struct video_renderer_webos_s {
     video_renderer_t base;
-    GstElement *appsrc, *pipeline;
+    GstElement *appsrc, *audio_appsrc, *pipeline;
+    GstClock *clock;
     pthread_mutex_t lock;
 
     int connections;
     int app_launched;
-    int tv_ready;              /* TV pipeline is bound to UDP_PORT */
-    time_t last_ready_check;
-    time_t ready_time;
-    int primes_done;
+    int tv_ready;              /* TV pipeline bound to UDP_PORT and settled */
+    long long launch_ms;       /* when the app was last (re)launched */
+    long long bound_ms;        /* when the port was first seen bound, 0 if not yet */
+    unsigned long tv_inode;    /* socket inode of the TV pipeline we stream to */
+    unsigned long stale_inode; /* pipeline being replaced; not "ready" */
+    long long last_ready_check;
 
+    /* Stats, logged every STATS_SECONDS while streaming */
+    time_t last_stats;
+    unsigned video_pushed, audio_pushed;
+
+    int width, height;         /* stream size the TV player was launched with */
     GstBuffer *sps_pps;        /* last codec config (frame_type 0) */
     GstBuffer *gop[GOP_MAX_BUFFERS];
     int gop_count;
@@ -92,6 +108,12 @@ typedef struct video_renderer_webos_s {
 } video_renderer_webos_t;
 
 static const video_renderer_funcs_t video_renderer_webos_funcs;
+
+static long long now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000LL + ts.tv_nsec / 1000000;
+}
 
 static void luna_send(const char *uri, const char *payload) {
     char cmd[512];
@@ -112,42 +134,89 @@ static void luna_send(const char *uri, const char *payload) {
 
 static void launch_app(video_renderer_webos_t *r) {
     char payload[256];
+    if (!r->width) {
+        r->width = 1920;
+        r->height = 1080;
+    }
     snprintf(payload, sizeof(payload),
-             "{\"id\":\"" APP_ID "\",\"params\":{\"udpPort\":%d,\"width\":1920,\"height\":1080,\"framerate\":30}}",
-             UDP_PORT);
+             "{\"id\":\"" APP_ID "\",\"params\":{\"udpPort\":%d,\"width\":%d,\"height\":%d,\"framerate\":30,"
+             "\"audioCodec\":\"AAC\",\"audioRate\":%d,\"audioChannels\":%d}}",
+             UDP_PORT, r->width, r->height, WEBOS_AUDIO_RATE, WEBOS_AUDIO_CHANNELS);
     luna_send("luna://com.webos.applicationManager/launch", payload);
     r->app_launched = 1;
     r->tv_ready = 0;
+    r->launch_ms = now_ms();
+    r->bound_ms = 0;
+    r->stale_inode = 0;
     r->last_ready_check = 0;
 }
 
 static int udp_port_bound(void);
+static unsigned long udp_port_inode(void);
 
 static void close_app(video_renderer_webos_t *r) {
     luna_send("luna://com.webos.applicationManager/closeByAppId", "{\"id\":\"" APP_ID "\"}");
     r->app_launched = 0;
     r->tv_ready = 0;
+    r->bound_ms = 0;
     /* Wait for the old pipeline to release the port so the next session
      * doesn't mistake it for its own */
     for (int i = 0; i < 30 && udp_port_bound(); i++)
         usleep(100000);
 }
 
-/* The Miracast pipeline binds 0.0.0.0:UDP_PORT once the app's <video> loads. */
-static int udp_port_bound(void) {
-    char want[16], line[256];
-    int found = 0;
-    snprintf(want, sizeof(want), ":%04X ", UDP_PORT);
+/* The Miracast pipeline binds 0.0.0.0:UDP_PORT once the app's <video> loads.
+ * Returns that socket's inode (identifies a pipeline instance), or 0. */
+static unsigned long udp_port_inode(void) {
+    char line[256];
+    unsigned long inode = 0;
     FILE *f = fopen("/proc/net/udp", "r");
     if (!f) return 0;
-    while (!found && fgets(line, sizeof(line), f)) {
-        /* local_address is the second column: "  sl: 00000000:1388 ..." */
-        char *local = strchr(line, ':');
-        if (local && strstr(local + 1, want) == strchr(local + 1, ':'))
-            found = 1;
+    fgets(line, sizeof(line), f);   /* header */
+    while (!inode && fgets(line, sizeof(line), f)) {
+        /* sl local_addr:port rem_addr:port st tx:rx tr:when retrnsmt uid timeout inode */
+        unsigned int port;
+        unsigned long ino;
+        if (sscanf(line, " %*d: %*x:%x %*x:%*x %*x %*x:%*x %*x:%*x %*x %*u %*u %lu",
+                   &port, &ino) == 2 && port == UDP_PORT)
+            inode = ino;
     }
     fclose(f);
-    return found;
+    return inode;
+}
+
+static int udp_port_bound(void) {
+    return udp_port_inode() != 0;
+}
+
+/* Call with the lock held. */
+static void check_ready(video_renderer_webos_t *r, long long now) {
+    if (r->tv_ready) return;
+    unsigned long inode;
+    if (!r->bound_ms && (inode = udp_port_inode()) != 0 && inode != r->stale_inode) {
+        printf("[webos-video] TV pipeline listening on %d (%lld ms after launch)\n",
+               UDP_PORT, now - r->launch_ms);
+        fflush(stdout);
+        r->bound_ms = now;
+        r->tv_inode = inode;
+    }
+    if (r->bound_ms && now - r->bound_ms >= TV_SETTLE_MS) {
+        printf("[webos-video] TV pipeline ready (%lld ms after launch)\n", now - r->launch_ms);
+        fflush(stdout);
+        r->tv_ready = 1;
+    }
+}
+
+/* The TV's Miracast decoder can't follow a resolution change (rotation), so
+ * relaunch the app: its webOSRelaunch handler replaces the <video>, giving a
+ * fresh pipeline. Frames are cached until that one is ready, then primed.
+ * Call with the lock held. */
+static void restart_tv_pipeline(video_renderer_webos_t *r) {
+    printf("[webos-video] restarting TV pipeline\n");
+    fflush(stdout);
+    unsigned long old_inode = r->tv_inode;
+    launch_app(r);
+    r->stale_inode = old_inode;
 }
 
 static void gop_clear(video_renderer_webos_t *r) {
@@ -157,8 +226,37 @@ static void gop_clear(video_renderer_webos_t *r) {
     r->gop_bytes = 0;
 }
 
+/* Buffers are stamped with the pipeline running time when they arrive, not
+ * when appsrc's thread dequeues them (do-timestamp). mpegtsmux interleaves by
+ * timestamp and needs a buffer on both pads; with dequeue-time stamps every
+ * queued video frame looked newer than the waiting audio frame, so only a
+ * frame or two got through per audio frame and video fell seconds behind at
+ * 60 fps. Arrival stamps also give the TV the real capture timing. */
+static void stamp(video_renderer_webos_t *r, GstBuffer *buffer) {
+    if (!r->clock) return;
+    GstClockTime now = gst_clock_get_time(r->clock) - gst_element_get_base_time(r->pipeline);
+    GST_BUFFER_PTS(buffer) = now;
+    GST_BUFFER_DTS(buffer) = now;
+}
+
 static void push(video_renderer_webos_t *r, GstBuffer *buffer) {
+    stamp(r, buffer);
     gst_app_src_push_buffer(GST_APP_SRC(r->appsrc), buffer);
+    r->video_pushed++;
+}
+
+/* Call with the lock held. Shows whether data backs up on our side. */
+static void log_stats(video_renderer_webos_t *r, time_t now) {
+    if (now - r->last_stats < STATS_SECONDS) return;
+    guint64 vq = 0, aq = 0;
+    g_object_get(r->appsrc, "current-level-bytes", &vq, NULL);
+    g_object_get(r->audio_appsrc, "current-level-bytes", &aq, NULL);
+    printf("[webos-stats] %lds: video %u frames, queued %llu B | audio %u frames, queued %llu B\n",
+           (long)(now - r->last_stats), r->video_pushed, (unsigned long long)vq,
+           r->audio_pushed, (unsigned long long)aq);
+    fflush(stdout);
+    r->video_pushed = r->audio_pushed = 0;
+    r->last_stats = now;
 }
 
 /* Replay codec config + GOP. The cache keeps its own buffers; pushes get copies. */
@@ -169,6 +267,104 @@ static void prime(video_renderer_webos_t *r) {
     if (r->sps_pps) push(r, gst_buffer_copy(r->sps_pps));
     for (int i = 0; i < r->gop_count; i++)
         push(r, gst_buffer_copy(r->gop[i]));
+}
+
+/* Minimal H.264 SPS reader: just enough to get the coded picture size. */
+typedef struct {
+    unsigned char rbsp[256];
+    int len, pos;   /* pos in bits */
+} bits_t;
+
+static unsigned bits_u(bits_t *b, int n) {
+    unsigned v = 0;
+    while (n--) {
+        int byte = b->pos >> 3;
+        v = (v << 1) | (byte < b->len ? (b->rbsp[byte] >> (7 - (b->pos & 7))) & 1 : 0);
+        b->pos++;
+    }
+    return v;
+}
+
+static unsigned bits_ue(bits_t *b) {
+    int zeros = 0;
+    while (bits_u(b, 1) == 0 && zeros < 32) zeros++;
+    return ((1u << zeros) - 1) + bits_u(b, zeros);
+}
+
+static int bits_se(bits_t *b) {
+    unsigned v = bits_ue(b);
+    return (v & 1) ? (int)((v + 1) / 2) : -(int)(v / 2);
+}
+
+static int sps_size(const unsigned char *data, int data_len, int *width, int *height) {
+    bits_t b = { .len = 0, .pos = 0 };
+    int i;
+    /* Find the SPS NAL (type 7) after a start code */
+    for (i = 0; i + 3 < data_len; i++)
+        if (data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 && (data[i + 3] & 0x1f) == 7)
+            break;
+    if (i + 3 >= data_len) return 0;
+    /* Unescape emulation prevention bytes up to the next start code */
+    for (i += 4; i < data_len && b.len < (int)sizeof(b.rbsp); i++) {
+        if (i + 2 < data_len && data[i] == 0 && data[i + 1] == 0 && data[i + 2] <= 1) break;
+        if (i + 2 < data_len && data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 3) {
+            b.rbsp[b.len++] = 0;
+            b.rbsp[b.len++] = 0;
+            i += 2;
+            continue;
+        }
+        b.rbsp[b.len++] = data[i];
+    }
+
+    unsigned profile = bits_u(&b, 8);
+    bits_u(&b, 16);                         /* constraint flags, level */
+    bits_ue(&b);                            /* sps id */
+    unsigned chroma = 1;
+    if (profile == 100 || profile == 110 || profile == 122 || profile == 244 || profile == 44 ||
+        profile == 83 || profile == 86 || profile == 118 || profile == 128) {
+        chroma = bits_ue(&b);
+        if (chroma == 3) bits_u(&b, 1);
+        bits_ue(&b);                        /* bit depth luma */
+        bits_ue(&b);                        /* bit depth chroma */
+        bits_u(&b, 1);
+        if (bits_u(&b, 1)) {                /* scaling matrices */
+            for (int n = 0; n < (chroma == 3 ? 12 : 8); n++) {
+                if (!bits_u(&b, 1)) continue;
+                int size = n < 6 ? 16 : 64, last = 8, next = 8;
+                for (int j = 0; j < size && next; j++) {
+                    next = (last + bits_se(&b) + 256) % 256;
+                    if (next) last = next;
+                }
+            }
+        }
+    }
+    bits_ue(&b);                            /* log2 max frame num */
+    unsigned poc_type = bits_ue(&b);
+    if (poc_type == 0) {
+        bits_ue(&b);
+    } else if (poc_type == 1) {
+        bits_u(&b, 1);
+        bits_se(&b);
+        bits_se(&b);
+        unsigned n = bits_ue(&b);
+        for (unsigned j = 0; j < n && j < 256; j++) bits_se(&b);
+    }
+    bits_ue(&b);                            /* max ref frames */
+    bits_u(&b, 1);
+    unsigned w_mbs = bits_ue(&b) + 1;
+    unsigned h_units = bits_ue(&b) + 1;
+    unsigned frame_mbs_only = bits_u(&b, 1);
+    if (!frame_mbs_only) bits_u(&b, 1);
+    bits_u(&b, 1);
+    unsigned cl = 0, cr = 0, ct = 0, cb = 0;
+    if (bits_u(&b, 1)) {
+        cl = bits_ue(&b); cr = bits_ue(&b); ct = bits_ue(&b); cb = bits_ue(&b);
+    }
+    unsigned sub_w = chroma == 1 || chroma == 2 ? 2 : 1;
+    unsigned sub_h = (chroma == 1 ? 2 : 1) * (2 - frame_mbs_only);
+    *width = w_mbs * 16 - (cl + cr) * sub_w;
+    *height = (2 - frame_mbs_only) * h_units * 16 - (ct + cb) * sub_h;
+    return *width > 0 && *height > 0;
 }
 
 static int is_idr(unsigned char *data, int data_len) {
@@ -207,12 +403,14 @@ video_renderer_t *video_renderer_gstreamer_init(logger_t *logger, video_renderer
     renderer->base.type = VIDEO_RENDERER_GSTREAMER;
     pthread_mutex_init(&renderer->lock, NULL);
 
-    char launch[512];
+    char launch[768];
     snprintf(launch, sizeof(launch),
-             "appsrc name=video_source is-live=true do-timestamp=true format=time stream-type=0 ! "
+             "appsrc name=video_source is-live=true format=time stream-type=0 ! "
              "h264parse config-interval=1 ! "
-             "video/x-h264,stream-format=byte-stream,alignment=au ! "
-             "mpegtsmux ! rtpmp2tpay ! "
+             "video/x-h264,stream-format=byte-stream,alignment=au ! mux. "
+             "appsrc name=audio_source is-live=true format=time stream-type=0 ! "
+             "aacparse ! mux. "
+             "mpegtsmux name=mux ! rtpmp2tpay ! "
              "udpsink host=127.0.0.1 port=%d sync=false async=false",
              UDP_PORT);
     printf("[webos-video] pipeline: %s\n", launch);
@@ -233,6 +431,16 @@ video_renderer_t *video_renderer_gstreamer_init(logger_t *logger, video_renderer
     g_object_set(renderer->appsrc, "caps", caps, NULL);
     gst_caps_unref(caps);
 
+    renderer->audio_appsrc = gst_bin_get_by_name(GST_BIN(renderer->pipeline), "audio_source");
+    caps = gst_caps_new_simple("audio/mpeg",
+        "mpegversion", G_TYPE_INT, 4,
+        "stream-format", G_TYPE_STRING, "adts",
+        "rate", G_TYPE_INT, WEBOS_AUDIO_RATE,
+        "channels", G_TYPE_INT, WEBOS_AUDIO_CHANNELS,
+        NULL);
+    g_object_set(renderer->audio_appsrc, "caps", caps, NULL);
+    gst_caps_unref(caps);
+
     printf("[webos-video] init complete\n");
     fflush(stdout);
     return &renderer->base;
@@ -241,7 +449,9 @@ video_renderer_t *video_renderer_gstreamer_init(logger_t *logger, video_renderer
 static void video_renderer_webos_start(video_renderer_t *renderer) {
     video_renderer_webos_t *r = (video_renderer_webos_t *)renderer;
     GstStateChangeReturn ret = gst_element_set_state(r->pipeline, GST_STATE_PLAYING);
-    printf("[webos-video] PLAYING returned %d\n", ret);
+    gst_element_get_state(r->pipeline, NULL, NULL, GST_SECOND);
+    r->clock = gst_element_get_clock(r->pipeline);
+    printf("[webos-video] PLAYING returned %d, clock %p\n", ret, (void*)r->clock);
     fflush(stdout);
 }
 
@@ -263,6 +473,26 @@ static void video_renderer_webos_render_buffer(video_renderer_t *renderer, raop_
     if (type == 0) {
         if (r->sps_pps) gst_buffer_unref(r->sps_pps);
         r->sps_pps = cached;
+        /* The TV player shows nothing if launched with the wrong size, and
+         * can't follow a size change. Found by testing on the 49UF850V:
+         * landscape needs its exact size, while portrait only works when
+         * the player is launched as 1920x1080. */
+        int w, h;
+        if (sps_size(data, data_len, &w, &h)) {
+            if (h > w) {
+                w = 1920;
+                h = 1080;
+            }
+            if (w != r->width || h != r->height) {
+                printf("[webos-video] stream size changed, player %dx%d -> %dx%d\n",
+                       r->width, r->height, w, h);
+                fflush(stdout);
+                r->width = w;
+                r->height = h;
+                if (r->app_launched)
+                    restart_tv_pipeline(r);
+            }
+        }
     } else {
         if (is_idr(data, data_len) || r->gop_count == GOP_MAX_BUFFERS ||
             r->gop_bytes + data_len > GOP_MAX_BYTES)
@@ -271,31 +501,40 @@ static void video_renderer_webos_render_buffer(video_renderer_t *renderer, raop_
         r->gop_bytes += data_len;
     }
 
-    time_t now = time(NULL);
-
     if (!r->tv_ready) {
-        if (now != r->last_ready_check) {
+        long long now = now_ms();
+        if (now - r->last_ready_check >= TV_READY_POLL_MS) {
             r->last_ready_check = now;
-            if (udp_port_bound()) {
-                printf("[webos-video] TV pipeline listening on %d\n", UDP_PORT);
-                r->tv_ready = 1;
-                r->ready_time = now;
-                r->primes_done = 0;
-            }
+            check_ready(r, now);
         }
-    } else if (prime_requested ||
-               (r->primes_done < PRIME_COUNT && now - r->ready_time >= prime_delays[r->primes_done])) {
-        /* The current frame is already in the GOP, so priming also sends it */
+        /* Became ready mid-stream: the current frame is already in the GOP */
+        if (r->tv_ready)
+            prime(r);
+    } else if (prime_requested) {
         prime_requested = 0;
-        if (r->primes_done < PRIME_COUNT) r->primes_done++;
         prime(r);
-        pthread_mutex_unlock(&r->lock);
-        return;
-    }
-
-    if (r->tv_ready && r->primes_done > 0)
+    } else {
         push(r, gst_buffer_copy(cached));
+    }
+    if (r->tv_ready)
+        log_stats(r, time(NULL));
     pthread_mutex_unlock(&r->lock);
+}
+
+/* Audio only flows while video is being sent: mpegtsmux waits for both
+ * inputs, so audio queued outside a session would pile up in appsrc. */
+void video_renderer_webos_push_audio(video_renderer_t *renderer, const unsigned char *adts, int len) {
+    video_renderer_webos_t *r = (video_renderer_webos_t *)renderer;
+    pthread_mutex_lock(&r->lock);
+    int streaming = r->tv_ready;
+    if (streaming) r->audio_pushed++;
+    pthread_mutex_unlock(&r->lock);
+    if (!streaming) return;
+
+    GstBuffer *buffer = gst_buffer_new_and_alloc(len);
+    gst_buffer_fill(buffer, 0, adts, len);
+    stamp(r, buffer);
+    gst_app_src_push_buffer(GST_APP_SRC(r->audio_appsrc), buffer);
 }
 
 void video_renderer_webos_flush(video_renderer_t *renderer) {
@@ -304,6 +543,7 @@ void video_renderer_webos_flush(video_renderer_t *renderer) {
 void video_renderer_webos_destroy(video_renderer_t *renderer) {
     video_renderer_webos_t *r = (video_renderer_webos_t *)renderer;
     gst_element_set_state(r->pipeline, GST_STATE_NULL);
+    if (r->clock) gst_object_unref(r->clock);
     gst_object_unref(r->pipeline);
     if (r->app_launched) close_app(r);
     gop_clear(r);
@@ -319,12 +559,32 @@ void video_renderer_webos_update_background(video_renderer_t *renderer, int type
     pthread_mutex_lock(&r->lock);
     if (type > 0) {
         r->connections++;
-        if (!r->app_launched) launch_app(r);
+        if (!r->app_launched) {
+            launch_app(r);
+            pthread_mutex_unlock(&r->lock);
+
+            /* Hold this connection until the TV can decode the first IDR */
+            int ready = 0;
+            for (int i = 0; i < TV_READY_TIMEOUT_SECONDS * 10 && !ready; i++) {
+                usleep(100000);
+                pthread_mutex_lock(&r->lock);
+                check_ready(r, now_ms());
+                ready = r->tv_ready;
+                pthread_mutex_unlock(&r->lock);
+            }
+            if (!ready) {
+                printf("[webos-video] TV pipeline not ready after %ds, continuing\n",
+                       TV_READY_TIMEOUT_SECONDS);
+                fflush(stdout);
+            }
+            return;
+        }
     } else if (type < 0 && r->connections > 0) {
         r->connections--;
         if (r->connections == 0) {
             if (r->app_launched) close_app(r);
             gop_clear(r);
+            r->width = r->height = 0;
             if (r->sps_pps) {
                 gst_buffer_unref(r->sps_pps);
                 r->sps_pps = NULL;

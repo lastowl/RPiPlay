@@ -45,7 +45,13 @@ tv <<EOF
 $stop_cmds
 mv $REMOTE_DIR/rpiplay.new $REMOTE_DIR/rpiplay
 chmod 755 $REMOTE_DIR/rpiplay
-nohup $REMOTE_DIR/rpiplay > /tmp/rpiplay.log 2>&1 &
+# Advertise under the TV's own network name (Settings > Network > TV Name)
+name=\$(luna-send -n 1 -w 3000 luna://com.webos.settingsservice/getSystemSettings \
+    '{"category":"network","keys":["deviceName"]}' < /dev/null |
+    sed -n 's/.*"deviceName": *"\([^"]*\)".*/\1/p')
+[ -n "\$name" ] || name="LG TV"
+echo "AirPlay name: \$name"
+nohup $REMOTE_DIR/rpiplay -n "\$name" > /tmp/rpiplay.log 2>&1 &
 sleep 2
 pidof rpiplay >/dev/null && echo "rpiplay running (pid \$(pidof rpiplay))" || { echo "rpiplay failed to start:"; cat /tmp/rpiplay.log; }
 EOF
