@@ -1,0 +1,13 @@
+.DS_Store
+
+# Build outputs
+output/
+
+# Pulled from the TV (LG/MStar proprietary) - kept locally, not tracked
+*.so
+*.so.*
+probe-work/
+tv-sysroot/
+
+# Upstream GStreamer 1.2.4 source used for headers (re-downloadable)
+gst12-headers/
