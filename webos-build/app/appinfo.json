@@ -1,0 +1,11 @@
+{
+    "id": "com.rpiplay.airplay",
+    "version": "1.0.0",
+    "vendor": "RPiPlay",
+    "type": "web",
+    "main": "index.html",
+    "title": "AirPlay Mirror",
+    "icon": "icon.png",
+    "transparent": true,
+    "handlesRelaunch": true
+}
