@@ -17,8 +17,11 @@ _start:
     /* Align stack to 8 bytes */
     bic sp, sp, #7
 
-    /* Push stack_end, rtld_fini, fini=NULL on stack */
+    /* Push stack_end, rtld_fini, fini=NULL on stack.
+     * Three words would leave sp 4 mod 8 at the call; AAPCS needs 8-byte
+     * alignment or variadic doubles/int64s are read off by a word. */
     mov r3, sp
+    sub sp, sp, #4      /* padding */
     push {r3}           /* stack_end */
     push {ip}           /* rtld_fini */
     mov r3, #0

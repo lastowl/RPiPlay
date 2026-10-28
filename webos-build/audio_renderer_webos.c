@@ -91,7 +91,10 @@ audio_renderer_t *audio_renderer_gstreamer_init(logger_t *logger, video_renderer
             "channels", G_TYPE_INT, 2,
             "mpegversion", G_TYPE_INT, 4,
             "stream-format", G_TYPE_STRING, "raw",
-            "codec_data", GST_TYPE_BUFFER, codec_data,
+            /* Not GST_TYPE_BUFFER: referencing the _gst_buffer_type variable
+             * makes the stub-linked binary copy-relocate it, and plugins then
+             * see a stale 0 GType (crashes mpegtsmux) */
+            "codec_data", gst_buffer_get_type(), codec_data,
             NULL);
         if (caps) {
             printf("[webos-audio] setting AAC-ELD caps\n");

@@ -10,7 +10,88 @@ html, body {
     background: transparent;
     overflow: hidden;
 }
+video {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 100%;
+    height: 100%;
+}
 </style>
 </head>
-<body></body>
+<body>
+<script>
+/*
+ * Plays the RTP/MPEG-TS stream RPiPlay sends to udpPort through the TV's
+ * built-in Miracast media pipeline (same mechanism as com.webos.app.miracast),
+ * so umediaserver and the compositor handle the video plane for us.
+ *
+ * Launch params (all optional):
+ *   {"udpPort":5000, "width":1920, "height":1080, "framerate":30, "lowLatency":true}
+ */
+var DEFAULTS = { udpPort: 5000, width: 1920, height: 1080, framerate: 30, lowLatency: true };
+
+function readParams() {
+    var p = {};
+    try {
+        if (window.PalmSystem && PalmSystem.launchParams)
+            p = JSON.parse(PalmSystem.launchParams) || {};
+    } catch (e) {
+        console.log("[airplay] bad launchParams: " + e);
+    }
+    var out = {};
+    for (var k in DEFAULTS)
+        out[k] = (p[k] !== undefined) ? p[k] : DEFAULTS[k];
+    return out;
+}
+
+function startPlayer() {
+    var p = readParams();
+    var old = document.getElementById("player");
+    if (old) {
+        old.pause();
+        old.parentNode.removeChild(old);
+    }
+
+    var option = {
+        mediaTransportType: "MIRACAST",
+        option: {
+            transmission: {
+                miracastInfo: {
+                    udpPort: p.udpPort,
+                    video: {
+                        codec: "H264",
+                        width: p.width,
+                        height: p.height,
+                        framerate: p.framerate,
+                        displayQueueSize: p.lowLatency ? 1 : 9
+                    }
+                }
+            }
+        }
+    };
+
+    var video = document.createElement("video");
+    video.id = "player";
+    video.autoplay = true;
+    var source = document.createElement("source");
+    source.src = "miracast://miracast";
+    source.type = "video/mp4; mediaOption=" + escape(JSON.stringify(option));
+    video.appendChild(source);
+    video.addEventListener("error", function () {
+        console.log("[airplay] video error " + (video.error && video.error.code));
+    });
+    video.addEventListener("playing", function () {
+        console.log("[airplay] playing");
+    });
+    document.body.appendChild(video);
+    video.load();
+    video.play();
+    console.log("[airplay] player started: " + JSON.stringify(p));
+}
+
+document.addEventListener("webOSRelaunch", startPlayer, true);
+startPlayer();
+</script>
+</body>
 </html>
