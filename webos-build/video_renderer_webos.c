@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <gst/gst.h>
 #include <gst/app/gstappsrc.h>
+#include <gst/app/gstappsink.h>
 #include <stdio.h>
 #include <signal.h>
 #include <unistd.h>
@@ -25,6 +26,10 @@
 #include <time.h>
 #include <pthread.h>
 #include <dirent.h>
+#include <sys/stat.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 #define APP_ID "com.rpiplay.airplay"
 #define UDP_PORT 5000
@@ -36,17 +41,36 @@
  * its port and had TV_SETTLE_MS to start up.
  *
  * As a fallback for streams that start anyway, the codec config and every
- * frame since the last IDR are kept and replayed ("primed") once when the TV
- * becomes ready. Replays are kept to that one: with an audio track the TV
- * plays every replayed frame in A/V sync mode, so repeated replays queue up
- * seconds of stale video. */
+ * frame since the last IDR are kept and replayed ("primed") when the TV
+ * becomes ready. A replay is repeated only if the TV shows nothing: with an
+ * audio track the TV plays every replayed frame in A/V sync mode, so repeated
+ * replays queue up seconds of stale video. */
 #define GOP_MAX_BUFFERS 600
 #define GOP_MAX_BYTES (8 * 1024 * 1024)
 #define TV_SETTLE_MS 1000
+#define REPLAY_SETTLE_MS 300       /* the same for a restarted pipeline */
 #define TV_READY_POLL_MS 100
 #define TV_READY_TIMEOUT_SECONDS 10
+#define STALE_SOCKET_WAIT_MS 3000
 #define STATS_SECONDS 5
+#define APP_EVENT_PORT 7737        /* must match EVENT_PORT in app/index.html */
+/* After a replay the TV reports videoInfo/"playing" within ~0.3 s when it
+ * shows the picture. The first replay to a new pipeline often shows nothing
+ * (always for landscape): it is what makes the pipeline add its demuxer pads
+ * and start the hardware decoder (seen in LG's logs), and the burst sent
+ * meanwhile is lost. A second replay then works, so retry after
+ * REPLAY_RETRY_MS, and restart the pipeline if that fails too. */
+#define REPLAY_RETRY_MS 1000
+#define PICTURE_TIMEOUT_MS 2000
+#define REPLAYS_BEFORE_RESTART 1
 #define PIPELINE_EXIT_TIMEOUT_MS 5000
+/* The TV pipeline reads UDP_PORT with the kernel's default receive buffer
+ * (net.core.rmem_default = rmem_max = 160 KB, roughly 70 RTP packets), and
+ * replays are 1-2 MB. RTP packets go out at up to SEND_RATE bytes/s, in
+ * bursts of at most SEND_BURST, so a reader stall can't overflow it (no drops
+ * have been seen either way). */
+#define SEND_RATE (6 * 1024 * 1024)
+#define SEND_BURST (48 * 1024)
 
 static volatile sig_atomic_t prime_requested = 0;
 
@@ -67,13 +91,38 @@ static void crash_handler(int sig, siginfo_t *info, void *ctx) {
     if (f) {
         char line[256];
         unsigned long pc = uc->uc_mcontext.arm_pc, lr = uc->uc_mcontext.arm_lr;
+        /* Executable mappings, for a heuristic backtrace (no frame pointers) */
+        struct { unsigned long start, end, off; char name[96]; } maps[128];
+        int nmaps = 0;
         while (fgets(line, sizeof(line), f)) {
-            unsigned long start, end;
-            if (sscanf(line, "%lx-%lx", &start, &end) == 2 &&
-                ((pc >= start && pc < end) || (lr >= start && lr < end)))
+            unsigned long start, end, off;
+            char perms[8], name[96] = "";
+            if (sscanf(line, "%lx-%lx %7s %lx %*s %*s %95s", &start, &end, perms, &off, name) < 4)
+                continue;
+            if ((pc >= start && pc < end) || (lr >= start && lr < end))
                 fprintf(stderr, ">>> %s", line);
+            if (perms[2] == 'x' && nmaps < 128) {
+                maps[nmaps].start = start;
+                maps[nmaps].end = end;
+                maps[nmaps].off = off;
+                strcpy(maps[nmaps].name, name);
+                nmaps++;
+            }
         }
         fclose(f);
+        /* Words on the stack that point into code are likely return addresses */
+        unsigned long *sp = (unsigned long *)uc->uc_mcontext.arm_sp;
+        fprintf(stderr, "  stack code pointers (file offsets):\n");
+        for (int i = 0, shown = 0; i < 2048 && shown < 40; i++) {
+            for (int m = 0; m < nmaps; m++) {
+                if (sp[i] >= maps[m].start && sp[i] < maps[m].end) {
+                    fprintf(stderr, "    sp+%d: %s+0x%lx\n", i * 4, maps[m].name,
+                            sp[i] - maps[m].start + maps[m].off);
+                    shown++;
+                    break;
+                }
+            }
+        }
         fflush(stderr);
     }
     _exit(128 + sig);
@@ -85,17 +134,30 @@ static void term_handler(int sig) {
 
 typedef struct video_renderer_webos_s {
     video_renderer_t base;
-    GstElement *appsrc, *audio_appsrc, *pipeline;
+    GstElement *appsrc, *audio_appsrc, *rtp_sink, *pipeline;
     GstClock *clock;
     pthread_mutex_t lock;
+    int udp_fd;                /* RTP to the TV pipeline */
+    long long send_due_us;     /* pacing: when the bytes sent so far are due */
 
     int connections;
     int app_launched;
     int tv_ready;              /* TV pipeline bound to UDP_PORT and settled */
     long long launch_ms;       /* when the app was last (re)launched */
     long long bound_ms;        /* when the port was first seen bound, 0 if not yet */
-    unsigned long stale_inode; /* socket of the pipeline being replaced */
+    unsigned long stale_inode; /* socket of the pipeline being replaced, 0 once closed */
     int restart_pending;       /* size changed while a pipeline was starting */
+    long long primed_ms;       /* when the GOP was replayed to the current pipeline, 0 if not */
+    unsigned primed_drops;     /* the TV socket's drop count at that replay */
+    int replays;               /* extra replays to the current pipeline */
+    int tv_showing;            /* the app reported umediaserver "playing" */
+    int need_idr;              /* nothing decodable cached; wait for the next IDR */
+    int gop_valid;             /* gop[0] is an IDR */
+
+    /* Debug: with RPIPLAY_DUMP_DIR set, each prime and the frames after it
+     * are written to <dir>/prime-N.h264 */
+    FILE *dump;
+    int dump_frames_left, dump_count;
     long long last_ready_check;
 
     /* Stats, logged every STATS_SECONDS while streaming */
@@ -112,10 +174,14 @@ typedef struct video_renderer_webos_s {
 
 static const video_renderer_funcs_t video_renderer_webos_funcs;
 
-static long long now_ms(void) {
+static long long now_us(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    return ts.tv_sec * 1000LL + ts.tv_nsec / 1000000;
+    return ts.tv_sec * 1000000LL + ts.tv_nsec / 1000;
+}
+
+static long long now_ms(void) {
+    return now_us() / 1000;
 }
 
 static void luna_send(const char *uri, const char *payload) {
@@ -149,6 +215,9 @@ static void launch_app(video_renderer_webos_t *r) {
     r->app_launched = 1;
     r->tv_ready = 0;
     r->restart_pending = 0;
+    r->primed_ms = 0;
+    r->replays = 0;
+    r->need_idr = 0;
     r->launch_ms = now_ms();
     r->bound_ms = 0;
     r->stale_inode = 0;
@@ -196,24 +265,46 @@ static void close_app(video_renderer_webos_t *r) {
     fflush(stdout);
 }
 
-/* The Miracast pipeline binds 0.0.0.0:UDP_PORT once the app's <video> loads.
- * Returns that socket's inode (identifies a pipeline instance), or 0. */
-static unsigned long udp_port_inode(void) {
+/* The Miracast pipeline binds 0.0.0.0:UDP_PORT once the app's <video> loads;
+ * the socket's inode identifies the pipeline instance. */
+typedef struct {
+    unsigned long inode;       /* 0 if none */
+    unsigned rx_queue;         /* receive buffer in use, bytes */
+    unsigned drops;            /* datagrams dropped because it was full */
+} udp_socket_t;
+
+/* Fills in a socket on UDP_PORT other than 'stale' and returns whether
+ * 'stale' is still bound too. */
+static int udp_port_scan(unsigned long stale, udp_socket_t *s) {
     char line[256];
-    unsigned long inode = 0;
+    int stale_bound = 0;
+    memset(s, 0, sizeof(*s));
     FILE *f = fopen("/proc/net/udp", "r");
     if (!f) return 0;
     fgets(line, sizeof(line), f);   /* header */
-    while (!inode && fgets(line, sizeof(line), f)) {
-        /* sl local_addr:port rem_addr:port st tx:rx tr:when retrnsmt uid timeout inode */
-        unsigned int port;
-        unsigned long ino;
-        if (sscanf(line, " %*d: %*x:%x %*x:%*x %*x %*x:%*x %*x:%*x %*x %*u %*u %lu",
-                   &port, &ino) == 2 && port == UDP_PORT)
-            inode = ino;
+    while (fgets(line, sizeof(line), f)) {
+        /* sl local:port rem:port st tx_queue:rx_queue tr:when retrnsmt uid timeout inode ref pointer drops */
+        unsigned int port, rx_queue, drops = 0;
+        unsigned long inode;
+        if (sscanf(line, " %*d: %*x:%x %*x:%*x %*x %*x:%x %*x:%*x %*x %*u %*d %lu %*d %*s %u",
+                   &port, &rx_queue, &inode, &drops) < 3 || port != UDP_PORT)
+            continue;
+        if (inode == stale) {
+            stale_bound = 1;
+        } else {
+            s->inode = inode;
+            s->rx_queue = rx_queue;
+            s->drops = drops;
+        }
     }
     fclose(f);
-    return inode;
+    return stale_bound;
+}
+
+static unsigned long udp_port_inode(void) {
+    udp_socket_t s;
+    udp_port_scan(0, &s);
+    return s.inode;
 }
 
 static int udp_port_bound(void) {
@@ -223,32 +314,44 @@ static int udp_port_bound(void) {
 /* Call with the lock held. */
 static void check_ready(video_renderer_webos_t *r, long long now) {
     if (r->tv_ready) return;
-    unsigned long inode;
-    if (!r->bound_ms && (inode = udp_port_inode()) != 0 && inode != r->stale_inode) {
+    udp_socket_t s;
+    int stale_bound = udp_port_scan(r->stale_inode, &s);
+    if (r->stale_inode && !stale_bound) {
+        printf("[webos-video] old pipeline's socket closed (%lld ms after launch)\n", now - r->launch_ms);
+        fflush(stdout);
+        r->stale_inode = 0;
+    }
+    if (!r->bound_ms && s.inode) {
         printf("[webos-video] TV pipeline listening on %d (%lld ms after launch)\n",
                UDP_PORT, now - r->launch_ms);
         fflush(stdout);
         r->bound_ms = now;
     }
-    if (r->bound_ms && now - r->bound_ms >= TV_SETTLE_MS) {
-        printf("[webos-video] TV pipeline ready (%lld ms after launch)\n", now - r->launch_ms);
+    /* Mid-stream there's a GOP to replay; at connection setup iOS waits */
+    long long settle = r->gop_count ? REPLAY_SETTLE_MS : TV_SETTLE_MS;
+    if (r->bound_ms && now - r->bound_ms >= settle) {
+        /* While both are bound the kernel may deliver to either, and a
+         * replay sent to the dying pipeline is lost */
+        if (stale_bound && now - r->bound_ms < settle + STALE_SOCKET_WAIT_MS)
+            return;
+        printf("[webos-video] TV pipeline ready (%lld ms after launch)%s\n", now - r->launch_ms,
+               stale_bound ? ", but the old pipeline's socket is still open" : "");
         fflush(stdout);
         r->tv_ready = 1;
     }
 }
 
 /* The TV's Miracast decoder can't follow a resolution change (rotation), so
- * close and relaunch the app for a fresh pipeline. Just relaunching (its
- * webOSRelaunch handler replaces the <video>) is faster, but quick repeated
- * relaunches left the TV's media pipeline stuck on black until the app was
- * closed. Frames are cached until the new pipeline is ready, then primed.
- * Call with the lock held; blocks while the old pipeline shuts down. */
+ * relaunch the app: its webOSRelaunch handler replaces the <video>, giving a
+ * fresh pipeline. Frames are cached until that one is ready, then primed.
+ * Closing the app instead was no more reliable, slower, and brought Live TV
+ * to the front (restarting its tuner pipeline) on every rotation.
+ * Call with the lock held. */
 static void restart_tv_pipeline(video_renderer_webos_t *r) {
     printf("[webos-video] restarting TV pipeline\n");
     fflush(stdout);
-    close_app(r);
-    /* close_app gives up after 5 s; don't mistake a lingering old pipeline
-     * for the new one */
+    /* The old pipeline keeps the port for ~0.4 s after the relaunch; don't
+     * mistake it for the new one. */
     unsigned long old_inode = udp_port_inode();
     launch_app(r);
     r->stale_inode = old_inode;
@@ -274,7 +377,21 @@ static void stamp(video_renderer_webos_t *r, GstBuffer *buffer) {
     GST_BUFFER_DTS(buffer) = now;
 }
 
+static void dump_buffer(video_renderer_webos_t *r, GstBuffer *buffer) {
+    GstMapInfo map;
+    if (!r->dump) return;
+    if (gst_buffer_map(buffer, &map, GST_MAP_READ)) {
+        fwrite(map.data, 1, map.size, r->dump);
+        gst_buffer_unmap(buffer, &map);
+    }
+    if (--r->dump_frames_left <= 0) {
+        fclose(r->dump);
+        r->dump = NULL;
+    }
+}
+
 static void push(video_renderer_webos_t *r, GstBuffer *buffer) {
+    dump_buffer(r, buffer);
     stamp(r, buffer);
     gst_app_src_push_buffer(GST_APP_SRC(r->appsrc), buffer);
     r->video_pushed++;
@@ -286,22 +403,74 @@ static void log_stats(video_renderer_webos_t *r, time_t now) {
     guint64 vq = 0, aq = 0;
     g_object_get(r->appsrc, "current-level-bytes", &vq, NULL);
     g_object_get(r->audio_appsrc, "current-level-bytes", &aq, NULL);
-    printf("[webos-stats] %lds: video %u frames, queued %llu B | audio %u frames, queued %llu B\n",
+    udp_socket_t s;
+    udp_port_scan(r->stale_inode, &s);
+    printf("[webos-stats] %lds: video %u frames, queued %llu B | audio %u frames, queued %llu B"
+           " | TV socket %u B, %u drops\n",
            (long)(now - r->last_stats), r->video_pushed, (unsigned long long)vq,
-           r->audio_pushed, (unsigned long long)aq);
+           r->audio_pushed, (unsigned long long)aq, s.rx_queue, s.drops);
     fflush(stdout);
     r->video_pushed = r->audio_pushed = 0;
     r->last_stats = now;
 }
 
-/* Replay codec config + GOP. The cache keeps its own buffers; pushes get copies. */
+/* Replay codec config + GOP to the TV pipeline. It must be followed by more
+ * frames: the TV's demuxer holds each frame until the next one starts, and
+ * an IDR sent on its own was never shown. (libpf-miracastplugin also flushes
+ * its UDP socket on play, but only when resuming from pause, not on a new
+ * pipeline's first play.) The cache keeps its own buffers; pushes get
+ * copies. Call with the lock held. */
 static void prime(video_renderer_webos_t *r) {
-    printf("[webos-video] priming TV decoder: sps/pps=%s, %d frames (%u bytes)\n",
-           r->sps_pps ? "yes" : "no", r->gop_count, (unsigned)r->gop_bytes);
+    r->tv_showing = 0;
+    if (!r->gop_valid || r->gop_count == 0) {
+        printf("[webos-video] no keyframe cached, waiting for the next one\n");
+        fflush(stdout);
+        r->need_idr = 1;
+        r->primed_ms = 0;
+        return;
+    }
+    udp_socket_t s;
+    udp_port_scan(r->stale_inode, &s);
+    r->primed_ms = now_ms();
+    r->primed_drops = s.drops;
+    printf("[webos-video] priming TV decoder: sps/pps=%s, %d frames (%u bytes); "
+           "TV socket %u bytes queued, %u drops so far\n",
+           r->sps_pps ? "yes" : "no", r->gop_count, (unsigned)r->gop_bytes, s.rx_queue, s.drops);
     fflush(stdout);
+    const char *dir = getenv("RPIPLAY_DUMP_DIR");
+    if (dir) {
+        char path[256];
+        if (r->dump) fclose(r->dump);
+        mkdir(dir, 0755);
+        snprintf(path, sizeof(path), "%s/prime-%d.h264", dir, ++r->dump_count);
+        r->dump = fopen(path, "wb");
+        r->dump_frames_left = 1 + r->gop_count + 180;
+    }
     if (r->sps_pps) push(r, gst_buffer_copy(r->sps_pps));
     for (int i = 0; i < r->gop_count; i++)
         push(r, gst_buffer_copy(r->gop[i]));
+}
+
+/* appsink callback: sends one RTP packet to the TV pipeline, paced to
+ * SEND_RATE (see there). Runs on our streaming thread, so waiting here only
+ * lets our appsrc queues absorb the backlog. */
+static GstFlowReturn send_rtp(GstAppSink *sink, gpointer user_data) {
+    video_renderer_webos_t *r = user_data;
+    GstSample *sample = gst_app_sink_pull_sample(sink);
+    if (!sample) return GST_FLOW_EOS;
+    GstBuffer *buffer = gst_sample_get_buffer(sample);
+    GstMapInfo map;
+    if (buffer && gst_buffer_map(buffer, &map, GST_MAP_READ)) {
+        long long now = now_us();
+        if (r->send_due_us < now) r->send_due_us = now;
+        long long ahead = r->send_due_us - now - SEND_BURST * 1000000LL / SEND_RATE;
+        if (ahead > 0) usleep(ahead);
+        r->send_due_us += map.size * 1000000LL / SEND_RATE;
+        send(r->udp_fd, map.data, map.size, 0);   /* fails while no pipeline listens */
+        gst_buffer_unmap(buffer, &map);
+    }
+    gst_sample_unref(sample);
+    return GST_FLOW_OK;
 }
 
 /* Minimal H.264 SPS reader: just enough to get the coded picture size. */
@@ -411,6 +580,78 @@ static int is_idr(unsigned char *data, int data_len) {
     return 0;
 }
 
+/* Startup logs "gst_structure_get_boolean: assertion `structure != NULL'
+ * failed" twice: LG's appsrc reads a "directv-rvu" flag from basesrc's
+ * LG-added "smart-properties" structure, which is unset. Harmless. Setting an
+ * empty structure silences it, but made the TV show black after every
+ * rotation, so it is left unset. */
+
+/* The app reports <video> and umediaserver events as HTTP GETs of
+ * http://127.0.0.1:APP_EVENT_PORT/<url-encoded message>. Log them with the
+ * time since the last (re)launch. */
+static void url_decode(char *s) {
+    char *out = s;
+    for (; *s; s++) {
+        unsigned int c;
+        if (*s == '%' && sscanf(s + 1, "%2x", &c) == 1) {
+            *out++ = (char)c;
+            s += 2;
+        } else {
+            *out++ = *s;
+        }
+    }
+    *out = 0;
+}
+
+static void *app_event_thread(void *arg) {
+    video_renderer_webos_t *r = arg;
+    int srv = socket(AF_INET, SOCK_STREAM, 0);
+    int one = 1;
+    struct sockaddr_in addr = { .sin_family = AF_INET, .sin_port = htons(APP_EVENT_PORT) };
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    if (srv < 0 || bind(srv, (struct sockaddr *)&addr, sizeof(addr)) < 0 || listen(srv, 8) < 0) {
+        printf("[webos-app] can't listen on %d for app events\n", APP_EVENT_PORT);
+        fflush(stdout);
+        return NULL;
+    }
+    for (;;) {
+        int c = accept(srv, NULL, NULL);
+        if (c < 0) continue;
+        char req[2048];
+        int n = recv(c, req, sizeof(req) - 1, 0);
+        static const char reply[] = "HTTP/1.0 204 No Content\r\nConnection: close\r\n\r\n";
+        send(c, reply, sizeof(reply) - 1, 0);
+        close(c);
+        if (n <= 0) continue;
+        req[n] = 0;
+        /* "GET /<message>?<seq> HTTP/1.1" */
+        char *msg = strchr(req, '/');
+        if (!msg || strncmp(req, "GET ", 4) != 0) continue;
+        msg++;
+        msg[strcspn(msg, "? \r\n")] = 0;
+        url_decode(msg);
+        pthread_mutex_lock(&r->lock);
+        long long now = now_ms(), since = now - r->launch_ms, after_prime = -1;
+        unsigned long stale = r->stale_inode;
+        unsigned primed_drops = r->primed_drops;
+        if (strstr(msg, "playbackNotificationInfo") && strstr(msg, "\"playing\"")) {
+            if (r->primed_ms && !r->tv_showing) after_prime = now - r->primed_ms;
+            r->tv_showing = 1;
+        }
+        pthread_mutex_unlock(&r->lock);
+        printf("[webos-app] +%lld ms: %s\n", since, msg);
+        if (after_prime >= 0) {
+            udp_socket_t s;
+            udp_port_scan(stale, &s);
+            printf("[webos-video] picture %lld ms after replay, %u drops since\n",
+                   after_prime, s.drops - primed_drops);
+        }
+        fflush(stdout);
+    }
+    return NULL;
+}
+
 video_renderer_t *video_renderer_gstreamer_init(logger_t *logger, video_renderer_config_t const *config) {
     video_renderer_webos_t *renderer;
     GError *error = NULL;
@@ -425,6 +666,7 @@ video_renderer_t *video_renderer_gstreamer_init(logger_t *logger, video_renderer
         sa.sa_flags = SA_SIGINFO;
         sigaction(SIGSEGV, &sa, NULL);
         sigaction(SIGABRT, &sa, NULL);
+        sigaction(SIGTRAP, &sa, NULL);  /* G_DEBUG=fatal-criticals */
     }
     signal(SIGTERM, term_handler);
     signal(SIGINT, term_handler);
@@ -446,8 +688,7 @@ video_renderer_t *video_renderer_gstreamer_init(logger_t *logger, video_renderer
              "appsrc name=audio_source is-live=true format=time stream-type=0 ! "
              "aacparse ! mux. "
              "mpegtsmux name=mux ! rtpmp2tpay ! "
-             "udpsink host=127.0.0.1 port=%d sync=false async=false",
-             UDP_PORT);
+             "appsink name=rtp_sink sync=false async=false");
     printf("[webos-video] pipeline: %s\n", launch);
     renderer->pipeline = gst_parse_launch(launch, &error);
     if (error) {
@@ -475,6 +716,19 @@ video_renderer_t *video_renderer_gstreamer_init(logger_t *logger, video_renderer
         NULL);
     g_object_set(renderer->audio_appsrc, "caps", caps, NULL);
     gst_caps_unref(caps);
+
+    renderer->udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in tv = { .sin_family = AF_INET, .sin_port = htons(UDP_PORT) };
+    tv.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (renderer->udp_fd < 0 || connect(renderer->udp_fd, (struct sockaddr *)&tv, sizeof(tv)) < 0)
+        printf("[webos-video] can't create the RTP socket\n");
+    renderer->rtp_sink = gst_bin_get_by_name(GST_BIN(renderer->pipeline), "rtp_sink");
+    GstAppSinkCallbacks callbacks = { .new_sample = send_rtp };
+    gst_app_sink_set_callbacks(GST_APP_SINK(renderer->rtp_sink), &callbacks, renderer, NULL);
+
+    pthread_t events;
+    if (pthread_create(&events, NULL, app_event_thread, renderer) == 0)
+        pthread_detach(events);
 
     printf("[webos-video] init complete\n");
     fflush(stdout);
@@ -530,11 +784,21 @@ static void video_renderer_webos_render_buffer(video_renderer_t *renderer, raop_
             }
         }
     } else {
-        if (is_idr(data, data_len) || r->gop_count == GOP_MAX_BUFFERS ||
-            r->gop_bytes + data_len > GOP_MAX_BYTES)
+        if (is_idr(data, data_len)) {
             gop_clear(r);
-        r->gop[r->gop_count++] = cached;
-        r->gop_bytes += data_len;
+            r->gop_valid = 1;
+        } else if (r->gop_count == GOP_MAX_BUFFERS || r->gop_bytes + data_len > GOP_MAX_BYTES) {
+            /* Frames after this are useless without the IDR being dropped,
+             * so cache nothing until the next one */
+            printf("[webos-video] GOP cache full, dropping it until the next keyframe\n");
+            fflush(stdout);
+            gop_clear(r);
+            r->gop_valid = 0;
+        }
+        if (r->gop_valid) {
+            r->gop[r->gop_count++] = gst_buffer_ref(cached);
+            r->gop_bytes += data_len;
+        }
     }
 
     if (!r->tv_ready) {
@@ -552,11 +816,34 @@ static void video_renderer_webos_render_buffer(video_renderer_t *renderer, raop_
     } else if (prime_requested) {
         prime_requested = 0;
         prime(r);
+    } else if (r->primed_ms && !r->tv_showing &&
+               now_ms() - r->primed_ms > (r->replays ? PICTURE_TIMEOUT_MS : REPLAY_RETRY_MS)) {
+        udp_socket_t s;
+        udp_port_scan(r->stale_inode, &s);
+        int replay = r->replays < REPLAYS_BEFORE_RESTART;
+        printf("[webos-video] no picture %lld ms after replay (TV socket %u bytes queued, %u drops since), %s\n",
+               now_ms() - r->primed_ms, s.rx_queue, s.drops - r->primed_drops,
+               replay ? "replaying again" : "restarting TV pipeline");
+        fflush(stdout);
+        if (replay) {
+            r->replays++;
+            prime(r);
+        } else {
+            restart_tv_pipeline(r);
+        }
+    } else if (r->need_idr) {
+        /* The current frame is cached only if it was an IDR */
+        if (r->gop_valid && r->gop_count == 1) {
+            r->need_idr = 0;
+            prime(r);
+        }
     } else {
         push(r, gst_buffer_copy(cached));
     }
     if (r->tv_ready)
         log_stats(r, time(NULL));
+    if (type != 0)
+        gst_buffer_unref(cached);   /* the GOP holds its own reference */
     pthread_mutex_unlock(&r->lock);
 }
 
@@ -583,7 +870,9 @@ void video_renderer_webos_destroy(video_renderer_t *renderer) {
     video_renderer_webos_t *r = (video_renderer_webos_t *)renderer;
     gst_element_set_state(r->pipeline, GST_STATE_NULL);
     if (r->clock) gst_object_unref(r->clock);
+    gst_object_unref(r->rtp_sink);
     gst_object_unref(r->pipeline);
+    if (r->udp_fd >= 0) close(r->udp_fd);
     if (r->app_launched) close_app(r);
     gop_clear(r);
     if (r->sps_pps) gst_buffer_unref(r->sps_pps);
@@ -623,6 +912,7 @@ void video_renderer_webos_update_background(video_renderer_t *renderer, int type
         if (r->connections == 0) {
             if (r->app_launched) close_app(r);
             gop_clear(r);
+            audio_renderer_webos_session_end();
             r->stream_width = r->stream_height = 0;
             if (r->sps_pps) {
                 gst_buffer_unref(r->sps_pps);

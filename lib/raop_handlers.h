@@ -483,7 +483,11 @@ raop_handler_get_parameter(raop_conn_t *conn,
 
             /* This is a bit ugly, but seems to be how airport works too */
             if ((datalen - (current - data) >= 8) && !strncmp(current, "volume\r\n", 8)) {
-                const char volume[] = "volume: 0.0\r\n";
+                float vol = 0.0f;
+                char volume[32];
+                if (conn->raop->callbacks.audio_get_volume)
+                    vol = conn->raop->callbacks.audio_get_volume(conn->raop->callbacks.cls);
+                snprintf(volume, sizeof(volume), "volume: %f\r\n", vol);
 
                 http_response_add_header(response, "Content-Type", "text/parameters");
                 *response_data = strdup(volume);
@@ -521,16 +525,26 @@ raop_handler_set_parameter(raop_conn_t *conn,
 
     content_type = http_request_get_header(request, "Content-Type");
     data = http_request_get_data(request, &datalen);
+    logger_log(conn->raop->logger, LOGGER_DEBUG, "SET_PARAMETER %s, %d bytes: %.*s",
+               content_type ? content_type : "(no content type)", datalen,
+               (content_type && !strncmp(content_type, "text/", 5) && data) ? (datalen < 120 ? datalen : 120) : 0,
+               data ? data : "");
+    if (!content_type) return;
     if (!strcmp(content_type, "text/parameters")) {
         char *datastr;
         datastr = calloc(1, datalen+1);
-        if (data && datastr && conn->raop_rtp) {
+        if (data && datastr && datalen >= 8 && !strncmp(data, "volume: ", 8)) {
+            /* Applied here, not on the audio thread: when mirroring, iOS
+             * sets up the audio stream only while something plays, but
+             * sends volume changes regardless */
+            float vol = 0.0;
             memcpy(datastr, data, datalen);
-            if ((datalen >= 8) && !strncmp(datastr, "volume: ", 8)) {
-                float vol = 0.0;
-                sscanf(datastr+8, "%f", &vol);
-                raop_rtp_set_volume(conn->raop_rtp, vol);
-            } else if ((datalen >= 10) && !strncmp(datastr, "progress: ", 10)) {
+            sscanf(datastr+8, "%f", &vol);
+            if (conn->raop->callbacks.audio_set_volume)
+                conn->raop->callbacks.audio_set_volume(conn->raop->callbacks.cls, vol);
+        } else if (data && datastr && conn->raop_rtp) {
+            memcpy(datastr, data, datalen);
+            if ((datalen >= 10) && !strncmp(datastr, "progress: ", 10)) {
                 unsigned int start, curr, end;
                 sscanf(datastr+10, "%u/%u/%u", &start, &curr, &end);
                 raop_rtp_set_progress(conn->raop_rtp, start, curr, end);

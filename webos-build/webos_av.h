@@ -13,4 +13,7 @@
 /* Push one ADTS AAC-LC frame. Dropped unless a mirroring session is streaming. */
 void video_renderer_webos_push_audio(video_renderer_t *renderer, const unsigned char *adts, int len);
 
+/* Forget the session's volume reference (the next iOS volume is the new baseline). */
+void audio_renderer_webos_session_end(void);
+
 #endif

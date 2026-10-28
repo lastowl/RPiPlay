@@ -43,6 +43,7 @@ struct raop_callbacks_s {
     void  (*audio_flush)(void *cls);
     void  (*video_flush)(void *cls);
     void  (*audio_set_volume)(void *cls, float volume);
+    float (*audio_get_volume)(void *cls);     /* reported to the sender; 0 dB if unset */
     void  (*audio_set_metadata)(void *cls, const void *buffer, int buflen);
     void  (*audio_set_coverart)(void *cls, const void *buffer, int buflen);
     void  (*audio_remote_control_id)(void *cls, const char *dacp_id, const char *active_remote_header);

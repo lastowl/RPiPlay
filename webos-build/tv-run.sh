@@ -3,7 +3,8 @@
 #
 # Uses the root sshd on port 22 started by persist/boot-root.sh, then chroots
 # into pid 1's root so RPiPlay runs outside the dev-mode jail (luna-send only
-# works there). Also installs the com.rpiplay.airplay app files.
+# works there). Also installs the com.rpiplay.airplay app files and
+# rpiplay-start.sh, which boot-root.sh runs at boot to start RPiPlay.
 #
 # Usage: ./webos-build/tv-run.sh [tv-ip]        (log: /tmp/rpiplay.log on the TV)
 #        ./webos-build/tv-run.sh [tv-ip] stop
@@ -22,14 +23,10 @@ tv() {
         '/proc/1/root/bin/busybox chroot /proc/1/root /bin/sh -s'
 }
 
-stop_cmds='
-pids=$(pidof rpiplay); [ -n "$pids" ] && kill $pids && sleep 1
-luna-send -n 1 -w 3000 luna://com.webos.applicationManager/closeByAppId "{\"id\":\"com.rpiplay.airplay\"}" >/dev/null 2>&1
-true
-'
+START=$REMOTE_DIR/rpiplay-start.sh
 
 if [ "$2" = "stop" ]; then
-    echo "$stop_cmds" | tv
+    echo "$START stop" | tv
     echo "stopped"
     exit 0
 fi
@@ -37,21 +34,20 @@ fi
 echo "=== Uploading binary and app to $TV ==="
 ssh -o BatchMode=yes -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedAlgorithms=+ssh-rsa \
     -i "$KEY" -p 22 "root@$TV" "cat > $REMOTE_DIR/rpiplay.new" < "$SCRIPT_DIR/output/rpiplay"
+ssh -o BatchMode=yes -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedAlgorithms=+ssh-rsa \
+    -i "$KEY" -p 22 "root@$TV" "cat > $START && chmod 755 $START" < "$SCRIPT_DIR/rpiplay-start.sh"
 COPYFILE_DISABLE=1 tar -C "$SCRIPT_DIR/app" --uid 0 --gid 0 -cf - . | ssh -o BatchMode=yes -o HostKeyAlgorithms=+ssh-rsa \
     -o PubkeyAcceptedAlgorithms=+ssh-rsa -i "$KEY" -p 22 "root@$TV" "tar -C $APP_DIR -xf -"
 
 echo "=== Restarting RPiPlay ==="
 tv <<EOF
-$stop_cmds
+$START stop
 mv $REMOTE_DIR/rpiplay.new $REMOTE_DIR/rpiplay
 chmod 755 $REMOTE_DIR/rpiplay
-# Advertise under the TV's own network name (Settings > Network > TV Name)
-name=\$(luna-send -n 1 -w 3000 luna://com.webos.settingsservice/getSystemSettings \
-    '{"category":"network","keys":["deviceName"]}' < /dev/null |
-    sed -n 's/.*"deviceName": *"\([^"]*\)".*/\1/p')
-[ -n "\$name" ] || name="LG TV"
-echo "AirPlay name: \$name"
-nohup $REMOTE_DIR/rpiplay -n "\$name" > /tmp/rpiplay.log 2>&1 &
+# Debug: RPIPLAY_DUMP_DIR=/tmp/rpdump ./tv-run.sh saves the H.264 sent after each rotation
+${RPIPLAY_DUMP_DIR:+rm -rf $RPIPLAY_DUMP_DIR; mkdir -p $RPIPLAY_DUMP_DIR; export RPIPLAY_DUMP_DIR=$RPIPLAY_DUMP_DIR}
+${RPIPLAY_ARGS:+export RPIPLAY_ARGS="$RPIPLAY_ARGS"}
+$START
 sleep 2
 pidof rpiplay >/dev/null && echo "rpiplay running (pid \$(pidof rpiplay))" || { echo "rpiplay failed to start:"; cat /tmp/rpiplay.log; }
 EOF

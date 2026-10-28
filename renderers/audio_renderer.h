@@ -51,6 +51,7 @@ typedef struct audio_renderer_funcs_s {
     void (*set_volume)(audio_renderer_t *renderer, float volume);
     void (*flush)(audio_renderer_t *renderer);
     void (*destroy)(audio_renderer_t *renderer);
+    float (*get_volume)(audio_renderer_t *renderer);   /* optional: volume to report to the sender */
 } audio_renderer_funcs_t;
 
 typedef struct audio_renderer_s {

@@ -349,6 +349,13 @@ extern "C" void audio_set_volume(void *cls, float volume) {
     }
 }
 
+extern "C" float audio_get_volume(void *cls) {
+    if (audio_renderer != NULL && audio_renderer->funcs->get_volume) {
+        return audio_renderer->funcs->get_volume(audio_renderer);
+    }
+    return 0.0f;
+}
+
 extern "C" void log_callback(void *cls, int level, const char *msg) {
     switch (level) {
         case LOGGER_DEBUG: {
@@ -384,6 +391,7 @@ int start_server(std::vector<char> hw_addr, std::string name, bool debug_log,
     raop_cbs.audio_flush = audio_flush;
     raop_cbs.video_flush = video_flush;
     raop_cbs.audio_set_volume = audio_set_volume;
+    raop_cbs.audio_get_volume = audio_get_volume;
 
     raop = raop_init(10, &raop_cbs);
     if (raop == NULL) {

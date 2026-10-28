@@ -43,7 +43,6 @@ typedef struct audio_renderer_webos_s {
     INT_PCM ring[RING_FRAMES * WEBOS_AUDIO_CHANNELS];
     int ring_read, ring_fill;
     int starved;
-    float gain;
 } audio_renderer_webos_t;
 
 static const audio_renderer_funcs_t audio_renderer_webos_funcs;
@@ -81,7 +80,7 @@ static void take_frame(audio_renderer_webos_t *r, INT_PCM *out) {
     for (int i = 0; i < avail; i++) {
         int idx = ((r->ring_read + i) % RING_FRAMES) * WEBOS_AUDIO_CHANNELS;
         for (int c = 0; c < WEBOS_AUDIO_CHANNELS; c++)
-            out[i * WEBOS_AUDIO_CHANNELS + c] = (INT_PCM)(r->ring[idx + c] * r->gain);
+            out[i * WEBOS_AUDIO_CHANNELS + c] = r->ring[idx + c];
     }
     r->ring_read = (r->ring_read + avail) % RING_FRAMES;
     r->ring_fill -= avail;
@@ -153,7 +152,6 @@ audio_renderer_t *audio_renderer_gstreamer_init(logger_t *logger, video_renderer
     r->base.funcs = &audio_renderer_webos_funcs;
     r->base.type = AUDIO_RENDERER_GSTREAMER;
     r->video_renderer = video_renderer;
-    r->gain = 1.0f;
     r->starved = 1;
     pthread_mutex_init(&r->lock, NULL);
 
@@ -217,13 +215,116 @@ static void audio_renderer_webos_render_buffer(audio_renderer_t *renderer, raop_
     pthread_mutex_unlock(&r->lock);
 }
 
+/*
+ * The iPhone's volume slider (16 steps of 30/16 dB above mute) drives the
+ * TV's master volume (0-100) along tv_volume_curve: fine steps at the bottom
+ * and coarse ones at the top, so low volumes stay adjustable and full volume
+ * is reachable. Each step moves from the TV's current volume, so the TV
+ * remote keeps working alongside. At connect iOS asks for the current volume
+ * (get_volume); the answer puts the slider at the TV's place on the curve.
+ */
+#define IOS_VOLUME_STEPS 16
+#define IOS_VOLUME_STEP_DB (30.0f / IOS_VOLUME_STEPS)
+#define IOS_MIN_DB -30.0f
+#define IOS_MUTE_DB -144.0f
+
+static const int tv_volume_curve[IOS_VOLUME_STEPS + 1] = {
+    0, 1, 2, 4, 6, 8, 10, 13, 17, 22, 28, 35, 43, 54, 66, 82, 100
+};
+
+/* The point on the curve nearest to a TV volume */
+static int curve_position(int tv_volume) {
+    int best = 0;
+    for (int i = 1; i <= IOS_VOLUME_STEPS; i++)
+        if (abs(tv_volume_curve[i] - tv_volume) < abs(tv_volume_curve[best] - tv_volume))
+            best = i;
+    return best;
+}
+
+static float volume_ref;        /* iOS volume that matches the TV's current volume */
+static int volume_ref_set, volume_muted;
+
+void audio_renderer_webos_session_end(void) {
+    volume_ref_set = 0;
+    volume_muted = 0;
+}
+
+/* Runs luna-send; returns the first line of the reply in out. */
+static int luna_call(const char *uri, const char *payload, char *out, int out_len) {
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "luna-send -n 1 -w 3000 %s '%s' 2>/dev/null", uri, payload);
+    FILE *fp = popen(cmd, "r");
+    if (!fp) return 0;
+    int ok = fgets(out, out_len, fp) != NULL;
+    pclose(fp);
+    return ok;
+}
+
+static int tv_get_volume(void) {
+    char reply[256];
+    const char *v;
+    if (!luna_call("luna://com.webos.audio/getVolume", "{}", reply, sizeof(reply)) ||
+        !(v = strstr(reply, "\"volume\":")))
+        return -1;
+    return atoi(v + 9);
+}
+
+static void tv_set_muted(int muted) {
+    char reply[256];
+    luna_call("luna://com.webos.audio/setMuted", muted ? "{\"muted\":true}" : "{\"muted\":false}",
+              reply, sizeof(reply));
+    printf("[webos-audio] TV %s\n", muted ? "muted" : "unmuted");
+    fflush(stdout);
+}
+
+static float audio_renderer_webos_get_volume(audio_renderer_t *renderer) {
+    (void)renderer;
+    int tv = tv_get_volume();
+    int position = tv < 0 ? IOS_VOLUME_STEPS / 2 : curve_position(tv);
+    volume_ref = IOS_MIN_DB + position * IOS_VOLUME_STEP_DB;
+    volume_ref_set = 1;
+    volume_muted = 0;
+    printf("[webos-audio] TV volume %d: reporting %.2f dB to iOS\n", tv, volume_ref);
+    fflush(stdout);
+    return volume_ref;
+}
+
 /* AirPlay volume: 0 dB (max) down to -30 dB, -144 for mute */
 static void audio_renderer_webos_set_volume(audio_renderer_t *renderer, float volume) {
-    audio_renderer_webos_t *r = (audio_renderer_webos_t *)renderer;
-    float gain = volume <= -30.0f ? 0.0f : powf(10.0f, volume / 20.0f);
-    pthread_mutex_lock(&r->lock);
-    r->gain = gain;
-    pthread_mutex_unlock(&r->lock);
+    (void)renderer;
+    if (volume <= IOS_MUTE_DB + 1.0f) {
+        if (!volume_muted) tv_set_muted(1);
+        volume_muted = 1;
+        return;
+    }
+    if (volume_muted) {
+        tv_set_muted(0);        /* then step from the volume before muting */
+        volume_muted = 0;
+    }
+    if (!volume_ref_set) {
+        volume_ref = volume;
+        volume_ref_set = 1;
+        printf("[webos-audio] iOS volume %.1f dB (not queried at connect), TV volume left as is\n", volume);
+        fflush(stdout);
+        return;
+    }
+    int steps = (int)roundf((volume - volume_ref) / IOS_VOLUME_STEP_DB);
+    if (steps == 0) return;
+    volume_ref += steps * IOS_VOLUME_STEP_DB;
+    int current = tv_get_volume();
+    if (current < 0) return;
+    int from = curve_position(current);
+    int position = from + steps;
+    /* Step down no further than 1 and leave silence to mute, so pushing the
+       slider to either end lines it up with the TV again */
+    if (position < 1) position = from < 1 ? from : 1;
+    if (position > IOS_VOLUME_STEPS) position = IOS_VOLUME_STEPS;
+    int target = tv_volume_curve[position];
+    char payload[64], reply[256];
+    snprintf(payload, sizeof(payload), "{\"volume\":%d}", target);
+    luna_call("luna://com.webos.audio/setVolume", payload, reply, sizeof(reply));
+    printf("[webos-audio] iOS volume %.1f dB: TV volume %d -> %d\n", volume, current, target);
+    fflush(stdout);
 }
 
 static void audio_renderer_webos_flush(audio_renderer_t *renderer) {
@@ -251,6 +352,7 @@ static const audio_renderer_funcs_t audio_renderer_webos_funcs = {
     .start = audio_renderer_webos_start,
     .render_buffer = audio_renderer_webos_render_buffer,
     .set_volume = audio_renderer_webos_set_volume,
+    .get_volume = audio_renderer_webos_get_volume,
     .flush = audio_renderer_webos_flush,
     .destroy = audio_renderer_webos_destroy,
 };

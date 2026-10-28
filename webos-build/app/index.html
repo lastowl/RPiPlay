@@ -31,6 +31,16 @@ video {
  *    "audioCodec":"AAC", "audioRate":48000, "audioChannels":2}
  * audioCodec "none" leaves audio out of the mediaOption.
  */
+/* RPiPlay listens here for player events (see video_renderer_webos.c) */
+var EVENT_PORT = 7737;
+var eventSeq = 0;
+
+/* Fire-and-forget: an image request needs no CORS permission */
+function report(msg) {
+    new Image().src = "http://127.0.0.1:" + EVENT_PORT + "/" +
+        encodeURIComponent(msg) + "?" + (eventSeq++);
+}
+
 var DEFAULTS = { udpPort: 5000, width: 1920, height: 1080, framerate: 30, lowLatency: true,
                  audioCodec: "AAC", audioRate: 48000, audioChannels: 2, testFile: "" };
 
@@ -84,7 +94,6 @@ function startPlayer() {
 
     var video = document.createElement("video");
     video.id = "player";
-    video.autoplay = true;
     video.loop = !!p.testFile;
     var source = document.createElement("source");
     if (p.testFile) {
@@ -96,16 +105,25 @@ function startPlayer() {
         source.type = "video/mp4; mediaOption=" + escape(JSON.stringify(option));
     }
     video.appendChild(source);
-    video.addEventListener("error", function () {
-        console.log("[airplay] video error " + (video.error && video.error.code));
+    /* Like com.webos.app.miracast: play only once the pipeline has loaded */
+    video.addEventListener("loadeddata", function () {
+        report("loadeddata");
+        video.play();
     });
-    video.addEventListener("playing", function () {
-        console.log("[airplay] playing");
+    /* umediaserver status: videoInfo, playbackNotificationInfo, errors */
+    video.addEventListener("umsmediainfo", function (e) {
+        report("umsmediainfo " + e.detail);
+    });
+    ["loadstart", "loadedmetadata", "canplay", "playing", "pause", "waiting",
+     "stalled", "suspend", "emptied", "ended"].forEach(function (name) {
+        video.addEventListener(name, function () { report(name); });
+    });
+    video.addEventListener("error", function () {
+        report("error " + (video.error && video.error.code));
     });
     document.body.appendChild(video);
     video.load();
-    video.play();
-    console.log("[airplay] player started: " + JSON.stringify(p));
+    report("player created " + p.width + "x" + p.height);
 }
 
 document.addEventListener("webOSRelaunch", startPlayer, true);
