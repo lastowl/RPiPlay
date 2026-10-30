@@ -261,24 +261,25 @@ reference (collected via `nm -u`). These stubs provide link-time resolution so
 the linker creates proper PLT entries; at runtime the TV's real libraries supply
 the implementations.
 
-### Custom CRT
+### Custom CRT (superseded)
 
-**Source file:** `crt1.S`
-
-The cross-compiler's default `crt1.o` calls `__libc_start_main` with the
-glibc 2.34 ABI (7 args, version-tagged `GLIBC_2.34`). The TV's glibc 2.19 only
-has the `GLIBC_2.4` version. Our custom `crt1.S` targets the older ABI:
-
-- ARM assembly, sets up argc/argv from the stack
-- Aligns the stack to 8 bytes (AAPCS requirement)
-- Calls `__libc_start_main` with `init = NULL`, `fini = NULL` (constructors run
-  via `.init_array` instead)
+The old toolchain (Debian cross-gcc linking against a copied `tv-sysroot` of
+the TV's glibc 2.19) needed a custom `crt1.S` (the compiler's own `crt1.o`
+called the glibc 2.34 `__libc_start_main` ABI) and a hand-built `ld`
+command line. Since 2026-10-30 the build uses the webosbrew buildroot-nc4
+SDK (glibc 2.12 sysroot), whose own CRT matches the target, so plain driver
+linking works and `crt1.S` was removed. History: the file called
+`__libc_start_main` with `init/fini = NULL` (constructors run via
+`.init_array`) after 8-byte stack alignment per AAPCS.
 
 ### glibc compatibility shims
 
 **Source file:** `glibc_compat.c`
 
-Bridges symbols that exist in glibc 2.34 but not 2.19:
+Written for the old toolchain (Debian glibc 2.34 objects linked against the
+TV's 2.19); with the buildroot SDK the dependencies are compiled against
+2.12 headers and most rows are unused - the file is kept as cheap insurance
+and still provides:
 
 | Symbol | Why needed | Shim |
 |--------|-----------|------|
@@ -300,17 +301,20 @@ glibc symbol redirections incompatible with glibc 2.19.
 
 ### Link order
 
-The linker is invoked directly (`arm-linux-gnueabi-ld`), not via the compiler
-driver, for full control over CRT components:
+Since the buildroot SDK switch, linking goes through the compiler driver
+(`$CXX`, `-static-libstdc++ -static-libgcc`). Effective order:
 
-1. Custom crt1.o + cross-compiler's crti.o + crtbeginS.o
+1. SDK CRT (crt1.o/crti.o/crtbegin from the glibc 2.12 sysroot)
 2. All application .o files (including glibc_compat.o)
 3. Static OpenSSL + libplist
-4. GStreamer/glib stub .so files (dynamic, creates DT_NEEDED entries)
-5. Static libstdc++ + libgcc + libgcc_eh
-6. TV's libc/libm/libpthread/libdl (glibc 2.19, from tv-sysroot)
-7. Dynamic libgcc_s (unwinding)
-8. crtendS.o + crtn.o
+4. GStreamer/glib stub .so files (`-Wl,--no-as-needed` keeps the DT_NEEDED
+   entries the TV's real libraries satisfy at runtime)
+5. Static libstdc++/libgcc (no libstdc++/libgcc_s at runtime)
+6. SDK libc/libm/libpthread/librt/libdl — verified requirement: GLIBC_2.4
+   (+ one GLIBC_2.7 symbol), so the binary runs on every webOS version
+
+(The pre-2026 build called `arm-linux-gnueabi-ld` directly with a custom
+crt1.o and the TV glibc 2.19 from tv-sysroot; see "Custom CRT" above.)
 
 ---
 
@@ -564,8 +568,7 @@ the replay path without rotating.
 | `audio_renderer_webos.c` | AAC-ELD→LC transcode, pacing, volume curve |
 | `webos_av.h` | Shared audio/video interface (push_audio, session_end) |
 | `dnssd_mdns.c` | Standalone mDNS for AirPlay discovery |
-| `crt1.S` | Custom CRT targeting glibc 2.4 ABI |
-| `glibc_compat.c` | stat/atexit/getentropy/explicit_bzero shims |
+| `glibc_compat.c` | stat/atexit/getentropy/explicit_bzero shims (insurance) |
 | `build.sh` | Docker build script |
 | `Dockerfile` | Cross-compile environment (OpenSSL, libplist, fdk-aac, stubs) |
 | `tv-run.sh` | Deploy and restart on the TV |
