@@ -1,0 +1,56 @@
+name: build-release
+
+# Tag push (v<version> matching webos-build/app/appinfo.json) -> build the
+# cross-compiled binary + ipk and publish a GitHub Release with the ipk.
+# Branch pushes / PRs / manual runs just build and keep the ipk as an artifact.
+
+on:
+  push:
+    tags: ["v*"]
+    branches: [webos-port]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write  # gh release create
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch TV sysroot (glibc 2.19, kept on the ci-sysroot branch)
+        run: |
+          git fetch --depth=1 origin ci-sysroot
+          mkdir -p webos-build/tv-sysroot
+          git show FETCH_HEAD:tv-sysroot.tar.gz | tar -C webos-build/tv-sysroot -xz
+          ls webos-build/tv-sysroot/lib/
+
+      - name: Build (Docker cross-compile)
+        run: ./webos-build/build.sh
+
+      - name: Package ipk
+        run: ./webos-build/package-app.sh
+
+      - name: Tag must match the app version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          v=$(python3 -I -c 'import json; print(json.load(open("webos-build/app/appinfo.json"))["version"])')
+          [ "${GITHUB_REF_NAME#v}" = "$v" ] \
+            || { echo "tag $GITHUB_REF_NAME does not match appinfo.json version $v"; exit 1; }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: webos-ipk
+          path: webos-build/output/*.ipk
+          if-no-files-found: error
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" webos-build/output/*.ipk \
+            --title "RPiPlay webOS $GITHUB_REF_NAME" \
+            --notes "AirPlay mirroring receiver for LG webOS TVs. Install the .ipk with \`webos-build/install-ipk.sh\` on a rooted TV — see [webos-build/INSTALL.md](blob/HEAD/webos-build/INSTALL.md)."
