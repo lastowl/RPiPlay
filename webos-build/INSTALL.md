@@ -182,6 +182,16 @@ path using StarfishMediaAPIs (direct H.264 feed) is planned — see
 - Volume control: iPhone slider drives TV volume (0-100, custom curve)
 - Rotation: handled automatically (app relaunch + GOP replay, ~0.3-1 s)
 
+## Related projects
+
+- **[danlflh/uxplay-webos](https://github.com/danlflh/uxplay-webos)** — an
+  AirPlay **2** receiver for rooted webOS TVs (3.9+), built on UxPlay: PIN
+  pairing, native app, direct hardware-decoder feed. If you want AirPlay 2
+  pairing/PIN or your TV runs webOS 3.5+, that is the one to use; ours focuses
+  on older sets (tested on webOS 2.2) with AirPlay 1 mirroring, 1080p,
+  measured low latency and boot autostart. The two projects are complementary
+  — worth a star.
+
 ## Technical documentation
 
 See [WEBOS-PORT.md](WEBOS-PORT.md) for the full technical deep-dive: how the

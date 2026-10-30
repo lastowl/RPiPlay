@@ -96,6 +96,28 @@ the difference is the delay. `RPIPLAY_NO_AUDIO=1` streams video only.
      native app with that output, keep the Miracast path as the rooted
      fallback; (3) switch to the webosbrew toolchain; (4) volume via the
      WebSocket API.
+   - Prior art found 2026-10-30: **danlflh/uxplay-webos** (GPL-3.0, v0.1.0
+     Sep 2026) is a UxPlay-based (AirPlay 2, PIN) receiver for rooted webOS
+     TVs: native app, SMP/ACB direct feed, SDL2, FFmpeg audio, webosbrew
+     toolchain — validated only on one webOS 3.9 panel, 720p/30, no boot
+     autostart. We differ on: webOS 2.2, 1080p, measured ~50 ms latency,
+     boot autostart, iPhone volume; it has AirPlay 2. Their docs: "Starfish's
+     buffering contributes latency on this older platform; stability is
+     prioritized over gaming latency" — latency unquantified.
+   - Assessment: the latency is most likely their AirPlay 2 transport
+     (LL-HLS-style segmenting) plus conservative queueing, not SMP itself —
+     moonlight-tv streams games through the same `libplayerAPIs`
+     BUFFERSTREAM/`lowDelayMode` path on the same class of panels, and Kodi
+     uses it for live TV. So SMP is not a dead end, but two cautions:
+     nobody has run it on webOS 2.2/LM15U, and their result is what the
+     low-latency knobs look like when they are not (or cannot be) set right
+     on the older "acb" ABI.
+   - Gate: **only switch video paths if the direct feed beats the current
+     Miracast path measurably (target < ~50 ms with audio, < ~24 ms video
+     only, clock-overlay method)** — the Miracast path is working, at 1080p,
+     and fully measured; parity is not a reason to rewrite. Reference:
+     their repo for ACB-on-2-4.x usage (GPL: study, do not copy into MIT),
+     webosbrew/samples media/smp, mariotaku/ss4s.
 
 2. **Packaging for others**
    - ~~Prebuilt ipk + binary~~ done (v1.1.0): the ipk bundles app + binary
