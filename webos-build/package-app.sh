@@ -1,25 +1,32 @@
 #!/bin/sh
-# Build com.rpiplay.airplay_<version>_all.ipk from webos-build/app and,
-# optionally, install it on the TV through appinstalld (dev-mode install).
+# Build com.rpiplay.airplay_<version>_all.ipk: the web app from webos-build/app
+# plus the rpiplay binary (in bin/) and rpiplay-start.sh, so a single file
+# contains everything needed to run. Installing it (rather than copying files
+# over the app dir) makes the application manager re-read appinfo.json.
 #
-# Installing (rather than copying files over the app dir) makes the
-# application manager re-read appinfo.json.
-#
-# Usage: ./webos-build/package-app.sh            # build only -> output/
-#        ./webos-build/package-app.sh install [tv-ip]
+# Usage: ./webos-build/package-app.sh                      # build only -> output/
+#        ./webos-build/package-app.sh install [tv-ip] [ssh-key]
+#                                                          # build, then install
+#                                                          # on the TV (install-ipk.sh)
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 APP_ID=com.rpiplay.airplay
 VERSION=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' "$SCRIPT_DIR/app/appinfo.json")
 OUT="$SCRIPT_DIR/output/${APP_ID}_${VERSION}_all.ipk"
+BIN="$SCRIPT_DIR/output/rpiplay"
+[ -f "$BIN" ] || { echo "no $BIN - run ./webos-build/build.sh first"; exit 1; }
 mkdir -p "$SCRIPT_DIR/output"
 # Under the project dir (not /var/folders) so Docker Desktop can mount it
 WORK=$(mktemp -d "$SCRIPT_DIR/output/.ipk.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
 
-mkdir -p "$WORK/data/usr/palm/applications/$APP_ID" "$WORK/data/usr/palm/packages/$APP_ID" "$WORK/control"
-cp "$SCRIPT_DIR"/app/* "$WORK/data/usr/palm/applications/$APP_ID/"
+APP="$WORK/data/usr/palm/applications/$APP_ID"
+mkdir -p "$APP/bin" "$WORK/data/usr/palm/packages/$APP_ID" "$WORK/control"
+cp "$SCRIPT_DIR"/app/* "$APP/"
+cp "$BIN" "$APP/bin/rpiplay"
+cp "$SCRIPT_DIR/rpiplay-start.sh" "$APP/rpiplay-start.sh"
+chmod 755 "$APP/bin/rpiplay" "$APP/rpiplay-start.sh"
 cat > "$WORK/data/usr/palm/packages/$APP_ID/packageinfo.json" <<EOF
 {
     "id": "$APP_ID",
@@ -34,7 +41,7 @@ Section: misc
 Priority: optional
 Architecture: all
 Installed-Size: 1
-Description: AirPlay mirroring receiver (RPiPlay)
+Description: AirPlay mirroring receiver (RPiPlay) for LG webOS
 webOS-Package-Format-Version: 2
 webOS-Packager-Version: x
 EOF
@@ -67,12 +74,5 @@ echo "built $OUT"
 
 [ "$1" = "install" ] || exit 0
 
-TV="${2:-192.168.50.99}"
-SSH="ssh -o BatchMode=yes -o ConnectTimeout=8 -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedAlgorithms=+ssh-rsa -i $HOME/.ssh/uf850v_webos -p 22 root@$TV"
-REMOTE=/media/developer/temp/$APP_ID.ipk
-$SSH "cat > $REMOTE" < "$OUT"
-$SSH '/proc/1/root/bin/busybox chroot /proc/1/root /bin/sh -s' <<EOF
-luna-send -n 1 -w 3000 luna://com.webos.applicationManager/closeByAppId '{"id":"$APP_ID"}' < /dev/null > /dev/null 2>&1
-luna-send -n 6 -w 30000 luna://com.webos.appInstallService/dev/install '{"id":"$APP_ID","ipkUrl":"$REMOTE","subscribe":true}' < /dev/null
-rm -f $REMOTE
-EOF
+# Install, chmod, boot hook, start
+exec "$SCRIPT_DIR/install-ipk.sh" "$OUT" "${2:-192.168.50.99}" "$3"

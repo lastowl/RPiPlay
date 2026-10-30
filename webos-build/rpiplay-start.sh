@@ -1,17 +1,21 @@
 #!/bin/sh
 # Start RPiPlay on the TV and keep it running (restarted if it exits).
 #
-# Must run in the TV's real root filesystem, outside the dev-mode jail,
-# because luna-send (used to show the player app) only works there. From a
-# jailed root shell:
-#   /proc/1/root/bin/busybox chroot /proc/1/root /bin/sh /media/developer/persist/rpiplay-start.sh
+# Lives in the com.rpiplay.airplay app dir (installed by the ipk from
+# package-app.sh) and runs the bundled binary from bin/ there. Must run in
+# the TV's real root filesystem, outside the dev-mode jail, because luna-send
+# (used to show the player app) only works there. From a jailed root shell:
+#   /proc/1/root/bin/busybox chroot /proc/1/root /bin/sh \
+#       /media/developer/apps/usr/palm/applications/com.rpiplay.airplay/rpiplay-start.sh
 #
-# Called at boot from persist/boot-root.sh and by tv-run.sh.
+# Called at boot from persist/boot-root.sh and by tv-run.sh and install-ipk.sh.
 #
 # Usage: rpiplay-start.sh [stop]
 # RPIPLAY_ARGS in the environment adds RPiPlay options (e.g. -d for debug logs).
 
-DIR=/media/developer/persist
+DIR=$(cd "$(dirname "$0")" && pwd)
+BIN=$DIR/bin/rpiplay
+[ -x "$BIN" ] || BIN=$DIR/rpiplay    # pre-1.1 layout: binary next to the script
 LOG=/tmp/rpiplay.log
 LOCK=/tmp/rpiplay-start.lock    # held (as a directory) by the running supervisor
 
@@ -63,7 +67,7 @@ echo "AirPlay name: $name"
     trap 'exit 0' TERM
     while true; do
         echo "=== rpiplay starting $(date) ===" >> $LOG
-        $DIR/rpiplay -n "$name" $RPIPLAY_ARGS >> $LOG 2>&1
+        $BIN -n "$name" $RPIPLAY_ARGS >> $LOG 2>&1
         echo "=== rpiplay exited ($?), restarting in 2s ===" >> $LOG
         sleep 2
     done

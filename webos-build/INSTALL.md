@@ -43,6 +43,22 @@ Replace `192.168.50.99` with your TV's IP address.
 RPiPlay will appear on your iPhone/iPad as an AirPlay receiver using the TV's
 network name. Open Control Centre, tap Screen Mirroring, and select it.
 
+## Install the prebuilt package
+
+If you only want to run it (no Docker, no building): take the
+`com.rpiplay.airplay_<version>_all.ipk` (from the GitHub releases, or build
+your own with `./webos-build/build.sh && ./webos-build/package-app.sh`) and
+run:
+
+```sh
+./webos-build/install-ipk.sh com.rpiplay.airplay_1.1.0_all.ipk 192.168.50.99
+```
+
+That one command installs the app and binary through the TV's package
+manager, makes them executable, sets up autostart at boot and starts
+RPiPlay right away. It needs the same root SSH access and key as above
+(different key: pass it as a third argument).
+
 ## Setup details
 
 ### SSH key
@@ -82,32 +98,34 @@ scp -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedAlgorithms=+ssh-rsa \
 
 These are gitignored (proprietary LG/glibc binaries).
 
-### Install the web app
+### Install the app
 
-The first `tv-run.sh` run copies the app files directly. To install it properly
-through the TV's package manager (picks up appinfo.json changes):
+The package (web app + `rpiplay` binary + start script) is built with:
 
 ```sh
-./webos-build/package-app.sh install 192.168.50.99
+./webos-build/package-app.sh              # -> webos-build/output/*.ipk
+./webos-build/package-app.sh install <tv-ip>   # build and install in one go
 ```
+
+Installing through the package manager (rather than copying files over the
+app dir) makes the application manager re-read appinfo.json. `tv-run.sh`
+deploys the same layout directly, without building an ipk.
 
 ### Auto-start at boot
 
-To have RPiPlay start automatically when the TV powers on, set up the boot
-script on the TV:
+`install-ipk.sh` and `tv-run.sh` keep a line in the TV's
+`/media/developer/persist/boot-root.sh` that starts RPiPlay when the TV
+powers on, so this normally needs no setup. To do it by hand:
 
 ```sh
 ssh <tv> # (with the flags above)
-cat > /media/developer/persist/boot-root.sh << 'BOOT'
-#!/bin/sh
-# Wait for network, then start RPiPlay
-sleep 10
-/media/developer/persist/rpiplay-start.sh &
+cat >> /media/developer/persist/boot-root.sh << 'BOOT'
+/media/developer/apps/usr/palm/applications/com.rpiplay.airplay/rpiplay-start.sh &
 BOOT
 chmod 755 /media/developer/persist/boot-root.sh
 ```
 
-`rpiplay-start.sh` (deployed by `tv-run.sh`) handles the respawn loop and
+`rpiplay-start.sh` (installed by the ipk) handles the respawn loop and
 reads the TV's name for AirPlay discovery.
 
 ## Usage

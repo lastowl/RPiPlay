@@ -98,8 +98,12 @@ the difference is the delay. `RPIPLAY_NO_AUDIO=1` streams video only.
      WebSocket API.
 
 2. **Packaging for others**
-   - Clean repo layout, build instructions, prebuilt ipk + binary.
-   - ~~Startup at boot~~ (done — `boot-root.sh` → `rpiplay-start.sh`).
+   - ~~Prebuilt ipk + binary~~ done (v1.1.0): the ipk bundles app + binary
+     (`bin/rpiplay`) + `rpiplay-start.sh`; `install-ipk.sh` installs, chmods,
+     sets the boot hook and starts in one command (`package-app.sh install`
+     builds and does the same).
+   - GitHub release carrying the prebuilt ipk + a download link in INSTALL.md.
+   - Clean repo layout, build instructions.
    - Remove leftovers: `gst_preload.c` unused; `HANDOVER-lite.md` partly wrong.
 
 ## Rotation notes
