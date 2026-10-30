@@ -91,6 +91,14 @@ the difference is the delay. `RPIPLAY_NO_AUDIO=1` streams video only.
      as root at boot (reliable from webOS 4.5; older needs HBChannel's
      Aug 2026 autostart fix or `webosbrew-autostart`); hyperion.ng-webos-
      loader is the model for a root daemon packaged as an HBChannel app.
+   - ~~switch to the webosbrew toolchain~~ done 2026-10-30 (awaiting TV
+     test): build.sh/Dockerfile now use the pinned buildroot-nc4
+     `2026.08-webos` SDK (glibc 2.12, host-arch-aware). Verified ELF:
+     soft-float (unchanged ABI - the SDK forces it regardless of flags),
+     max symbol requirement GLIBC_2.4/2.7 (was 2.19-specific), no
+     libstdc++/libgcc_s needed. tv-sysroot + crt1.S + manual ld all
+     deleted; the ci-sysroot branch keeps the old blobs for reference.
+     Ship as v1.2.0 once the TV run passes.
    - Proposed order: (1) prove the direct-feed player on this TV from dev
      mode with webosbrew's smp sample; (2) if it works, make RPiPlay a
      native app with that output, keep the Miracast path as the rooted

@@ -31,7 +31,7 @@ You need:
 git clone -b webos-port https://github.com/lastowl/RPiPlay.git
 cd RPiPlay
 
-# Build (first run pulls/builds the Docker image — takes a few minutes)
+# Build (first run downloads the webOS SDK image - takes ~10 minutes)
 ./webos-build/build.sh
 
 # Deploy and start on the TV
@@ -74,29 +74,15 @@ ssh -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedAlgorithms=+ssh-rsa \
     -i ~/.ssh/uf850v_webos -p 22 root@<tv-ip>
 ```
 
-### TV sysroot
+### Toolchain
 
-The build links against the TV's glibc 2.19. You need a copy of the TV's
-`/lib` in `webos-build/tv-sysroot/lib/`. The essential files:
-
-```
-libc-2.19.so  libc.so.6  ld-linux.so.3
-libm-2.19.so  libm.so.6
-libpthread-2.19.so  libpthread.so.0
-libdl-2.19.so  libdl.so.2
-```
-
-Copy them from the TV:
-
-```sh
-mkdir -p webos-build/tv-sysroot/lib
-scp -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedAlgorithms=+ssh-rsa \
-    -i ~/.ssh/uf850v_webos -P 22 \
-    'root@<tv-ip>:/lib/libc-* /lib/libc.so.6 /lib/ld-linux.so.3 /lib/libm-* /lib/libm.so.6 /lib/libpthread-* /lib/libpthread.so.0 /lib/libdl-* /lib/libdl.so.2' \
-    webos-build/tv-sysroot/lib/
-```
-
-These are gitignored (proprietary LG/glibc binaries).
+The build is fully contained in Docker: `build.sh` pulls the pinned
+[webosbrew native SDK](https://github.com/webosbrew/native-toolchain)
+(buildroot-nc4, glibc 2.12), so nothing from the TV is needed to compile.
+The resulting binary requires only `GLIBC_2.4`/`GLIBC_2.7` symbols and
+should run on any webOS version. (Older checkouts linked against a
+`tv-sysroot/` copy of the TV's glibc 2.19 - no longer required; the
+`ci-sysroot` branch keeps it for reference.)
 
 ### Install the app
 

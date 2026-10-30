@@ -20,13 +20,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Fetch TV sysroot (glibc 2.19, kept on the ci-sysroot branch)
-        run: |
-          git fetch --depth=1 origin ci-sysroot
-          mkdir -p webos-build/tv-sysroot
-          git show FETCH_HEAD:tv-sysroot.tar.gz | tar -C webos-build/tv-sysroot -xz
-          ls webos-build/tv-sysroot/lib/
-
       - name: Build (Docker cross-compile)
         run: ./webos-build/build.sh
 

@@ -23,15 +23,18 @@ mkdir -p "$OUTPUT_DIR"
 docker run --rm \
     -v "$ROOT_DIR:/src:ro" \
     -v "$SCRIPT_DIR:/webos:ro" \
-    -v "$SCRIPT_DIR/tv-sysroot:/tv-sysroot:ro" \
     -v "$OUTPUT_DIR:/output" \
     "$BUILD_IMAGE" \
     bash -c '
 set -e
 
-CC=arm-linux-gnueabi-gcc
-CXX=arm-linux-gnueabi-g++
-CFLAGS="-O2 -march=armv7-a -mfloat-abi=soft -fno-stack-protector"
+CC=arm-webos-linux-gnueabi-gcc
+CXX=arm-webos-linux-gnueabi-g++
+# webosbrew SDK (buildroot-nc4 2026.08-webos): glibc 2.12, soft-float - the
+# toolchain is built soft-float-only and forces it (verified: no
+# Tag_ABI_VFP_args in the output ELF), same ABI as the previous builds.
+# A future softfp-only SDK would then fail loudly at link, not silently.
+CFLAGS="-O2 -march=armv7-a -mfpu=neon-fp16 -mfloat-abi=soft -fno-stack-protector"
 CXXFLAGS="$CFLAGS"
 
 OPENSSL_DIR=/deps/openssl-arm
@@ -50,8 +53,8 @@ INC="-I/src/lib -I/src/lib/playfair -I/src/lib/llhttp -I/src/renderers"
 INC="$INC -I$OPENSSL_DIR/include -I$PLIST_DIR/include"
 INC="$INC $GST_CFLAGS"
 
-# Defines — NO _FILE_OFFSET_BITS=64 or _LARGEFILE64_SOURCE
-# Those trigger newer glibc symbol redirections incompatible with glibc 2.19
+# Defines — no _FILE_OFFSET_BITS=64 / _LARGEFILE64_SOURCE: they redirect to
+# 64-bit symbols that the SDK glibc 2.12 does not have
 DEFS="-DSTANDALONE -D__STDC_CONSTANT_MACROS -D__STDC_LIMIT_MACROS"
 DEFS="$DEFS -DTARGET_POSIX -D_LINUX -D_REENTRANT"
 DEFS="$DEFS -DHAS_GSTREAMER_RENDERER -DHAS_DUMMY_RENDERER"
@@ -93,7 +96,7 @@ $CC $CFLAGS $DEFS $INC -c /src/renderers/audio_renderer_dummy.c -o $WORKDIR/obj/
 FDK=/src/renderers/fdk-aac
 FDK_INC=""
 for d in $FDK/lib*/include; do FDK_INC="$FDK_INC -I$d"; done
-FDK_CACHE=/output/.fdk-obj
+FDK_CACHE=/output/.fdk-obj-softfp   # ABI-tagged: old float-abi=soft objects must not be reused
 if [ ! -f $FDK_CACHE/.done ]; then
     echo "  fdk-aac (first build, cached afterwards)..."
     mkdir -p $FDK_CACHE
@@ -121,10 +124,6 @@ $CC $CFLAGS -c /webos/glibc_compat.c -o $WORKDIR/obj/glibc_compat.o
 echo "  main..."
 $CXX $CXXFLAGS $DEFS $INC -c /src/rpiplay.cpp -o $WORKDIR/obj/rpiplay.o
 
-# Assemble custom CRT (targets glibc 2.4+ __libc_start_main ABI)
-echo "  custom crt1..."
-$CC -c /webos/crt1.S -o $WORKDIR/crt1.o
-
 # Create stub ARM shared libraries that export GStreamer/glib symbols.
 # These provide link-time resolution so the linker creates proper PLT entries.
 # At runtime on the TV, the real libraries provide the actual implementations.
@@ -132,7 +131,7 @@ echo "=== Creating stub libraries ==="
 mkdir -p /deps/stub-libs
 
 # Collect all undefined GStreamer/glib symbols from our object files
-arm-linux-gnueabi-nm -u $WORKDIR/obj/*.o 2>/dev/null \
+arm-webos-linux-gnueabi-nm -u $WORKDIR/obj/*.o 2>/dev/null \
     | grep "U " | sed "s/.*U //" | sort -u \
     | grep -E "^(gst_|g_type_|g_object_|g_error_|_gst_|GST_)" > /tmp/gst_syms.txt
 
@@ -156,81 +155,35 @@ for lib in gstreamer-1.0 gstapp-1.0 gstvideo-1.0 gobject-2.0 glib-2.0; do
     echo "  created stub lib${lib}.so (with real symbol exports)"
 done
 
-# Set up linker-friendly symlinks in a writable copy of tv-sysroot
-echo "=== Preparing TV sysroot for linking ==="
-mkdir -p /tmp/tv-sysroot/lib
-cp -a /tv-sysroot/lib/* /tmp/tv-sysroot/lib/
-# Ensure linker can find libs via -l flags
-cd /tmp/tv-sysroot/lib
-for f in libc libm libpthread libdl; do
-    if [ ! -e ${f}.so ]; then
-        target=$(ls ${f}-*.so ${f}.so.* 2>/dev/null | head -1)
-        [ -n "$target" ] && ln -sf "$(basename $target)" ${f}.so
-    fi
-done
-ls -la /tmp/tv-sysroot/lib/
-cd /
+echo "=== Linking (SDK: glibc 2.12, static libstdc++/libgcc) ==="
 
-# Find cross-compiler CRT/GCC paths
-CRTI=$($CC -print-file-name=crti.o)
-CRTN=$($CC -print-file-name=crtn.o)
-CRTBEGIN=$($CC -print-file-name=crtbeginS.o)
-CRTEND=$($CC -print-file-name=crtendS.o)
-GCC_LIB=$($CC -print-file-name=libgcc.a)
-GCC_LIB_DIR=$(dirname $GCC_LIB)
-STDCXX_DIR=$(dirname $($CXX -print-file-name=libstdc++.a))
-
-echo "  crti: $CRTI"
-echo "  crtn: $CRTN"
-echo "  crtbegin: $CRTBEGIN"
-echo "  crtend: $CRTEND"
-echo "  gcc lib dir: $GCC_LIB_DIR"
-echo "  libstdc++ dir: $STDCXX_DIR"
-
-echo "=== Linking with TV glibc 2.19 ==="
-
-# Link order:
-# 1. CRT prologue (our custom crt1 + cross-compiler crti/crtbegin)
-# 2. All application object files (including glibc_compat.o)
-# 3. Static libs (OpenSSL, libplist)
-# 4. GStreamer stubs (dynamic, for DT_NEEDED entries)
-# 5. Static C++ runtime (libstdc++, libgcc, libgcc_eh)
-# 6. TV system libs (libc, libm, libpthread, libdl from glibc 2.19)
-# 7. Dynamic gcc support (libgcc_s for unwinding)
-# 8. CRT epilogue (crtend, crtn)
-
-arm-linux-gnueabi-ld \
-    --dynamic-linker /lib/ld-linux.so.3 \
-    -rpath-link /tmp/tv-sysroot/lib \
-    $WORKDIR/crt1.o $CRTI $CRTBEGIN \
+# Link order matters: objects, then static libs (OpenSSL, libplist), the
+# GStreamer stubs (--no-as-needed keeps NEEDED entries so the TV resolves
+# them at runtime), then the maths/pthread/dl system libs.
+$CXX $CFLAGS -o /output/rpiplay \
     $WORKDIR/obj/*.o \
     -L$OPENSSL_DIR/lib -lcrypto \
     -L$PLIST_DIR/lib -lplist-2.0 \
-    -L/deps/stub-libs --no-as-needed \
+    -L/deps/stub-libs -Wl,--no-as-needed \
     -lgstreamer-1.0 -lgstapp-1.0 -lgstvideo-1.0 -lgobject-2.0 -lglib-2.0 \
-    --as-needed \
-    -L$STDCXX_DIR -L$GCC_LIB_DIR \
-    -Bstatic -lstdc++ -lgcc -lgcc_eh -Bdynamic \
-    -L/tmp/tv-sysroot/lib \
-    -lm -lpthread -ldl -lc \
-    /tmp/tv-sysroot/lib/ld-linux.so.3 \
-    -lgcc_s \
-    $CRTEND $CRTN \
-    -o /output/rpiplay
+    -Wl,--as-needed \
+    -static-libstdc++ -static-libgcc \
+    -lm -lpthread -ldl
 
 echo ""
 echo "=== Build complete ==="
 # `file` is not in the ubuntu image; readelf is (and says more)
-arm-linux-gnueabi-readelf -h /output/rpiplay | grep -E "Magic|Machine|Type"
-arm-linux-gnueabi-size /output/rpiplay
+arm-webos-linux-gnueabi-readelf -h /output/rpiplay | grep -E "Magic|Machine|Type"
+arm-webos-linux-gnueabi-size /output/rpiplay
 echo ""
 echo "=== Dynamic dependencies ==="
-arm-linux-gnueabi-readelf -d /output/rpiplay | grep NEEDED
+arm-webos-linux-gnueabi-readelf -d /output/rpiplay | grep NEEDED
 echo ""
 echo "=== Glibc version requirements ==="
-arm-linux-gnueabi-readelf -V /output/rpiplay 2>/dev/null | grep -A1 "Version:" || echo "(none found)"
-arm-linux-gnueabi-objdump -T /output/rpiplay 2>/dev/null | grep GLIBC | sort -t@ -k2 -V | tail -20 || true
+arm-webos-linux-gnueabi-readelf -V /output/rpiplay 2>/dev/null | grep -A1 "Version:" || echo "(none found)"
+arm-webos-linux-gnueabi-objdump -T /output/rpiplay 2>/dev/null | grep GLIBC | sort -t@ -k2 -V | tail -20 || true
 '
+
 
 echo ""
 echo "=== Output ==="
