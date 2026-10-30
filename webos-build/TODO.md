@@ -124,7 +124,10 @@ the difference is the delay. `RPIPLAY_NO_AUDIO=1` streams video only.
      (`bin/rpiplay`) + `rpiplay-start.sh`; `install-ipk.sh` installs, chmods,
      sets the boot hook and starts in one command (`package-app.sh install`
      builds and does the same).
-   - GitHub release carrying the prebuilt ipk + a download link in INSTALL.md.
+   - ~~GitHub release carrying the prebuilt ipk~~ done 2026-10-30: CI
+     (`.github/workflows/build-release.yml`) builds on tag `v<version>` and
+     attaches the ipk; lastowl/RPiPlay releases page is live, INSTALL.md
+     links it. Build inputs: TV sysroot on orphan branch `ci-sysroot`.
    - Clean repo layout, build instructions.
    - Remove leftovers: `gst_preload.c` unused; `HANDOVER-lite.md` partly wrong.
 

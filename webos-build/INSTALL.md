@@ -45,10 +45,10 @@ network name. Open Control Centre, tap Screen Mirroring, and select it.
 
 ## Install the prebuilt package
 
-If you only want to run it (no Docker, no building): take the
-`com.rpiplay.airplay_<version>_all.ipk` (from the GitHub releases, or build
-your own with `./webos-build/build.sh && ./webos-build/package-app.sh`) and
-run:
+If you only want to run it (no Docker, no building): download
+`com.rpiplay.airplay_<version>_all.ipk` from the
+[releases page](https://github.com/lastowl/RPiPlay/releases) (or build your
+own with `./webos-build/build.sh && ./webos-build/package-app.sh`) and run:
 
 ```sh
 ./webos-build/install-ipk.sh com.rpiplay.airplay_1.1.0_all.ipk 192.168.50.99
