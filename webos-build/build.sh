@@ -220,7 +220,8 @@ arm-linux-gnueabi-ld \
 
 echo ""
 echo "=== Build complete ==="
-file /output/rpiplay
+# `file` is not in the ubuntu image; readelf is (and says more)
+arm-linux-gnueabi-readelf -h /output/rpiplay | grep -E "Magic|Machine|Type"
 arm-linux-gnueabi-size /output/rpiplay
 echo ""
 echo "=== Dynamic dependencies ==="
