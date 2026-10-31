@@ -128,6 +128,22 @@ do
     [ -x "$cand" ] && { SSHD=$cand; break; }
 done
 
+# A sshd mmapped from cryptofs at boot+20s crashes its per-connection
+# children later ("undefined instruction" in dmesg): LG remounts cryptofs
+# partitions while booting and the not-yet-faulted pages come back wrong.
+# Copy the few megabytes of openssh to tmpfs (RAM, unmount-proof) instead.
+if [ -n "$SSHD" ] && [ "${SSHD#/media/cryptofs}" != "$SSHD" ]; then
+    RUNDIR=/tmp/openssh-run
+    if [ ! -x "$RUNDIR/sbin/sshd" ]; then
+        mkdir -p "$RUNDIR"
+        cp -a "${SSHD%/sbin/sshd}/." "$RUNDIR/" 2>/dev/null
+    fi
+    if [ -x "$RUNDIR/sbin/sshd" ]; then
+        SSHD=$RUNDIR/sbin/sshd
+        log "sshd copied to RAM ($RUNDIR)"
+    fi
+fi
+
 # Wait for a real network address (up to ~30s) so sshd binds once networking
 # is actually up; skip if something already owns port 22.
 i=0
