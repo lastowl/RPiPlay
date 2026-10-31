@@ -271,6 +271,26 @@ variant and its error analysis): `webos-build/LATENCY-MEASUREMENTS.md`.
       or standby power to carry video — likely not possible on LM15U,
       park until tier 2 feels bad.
 
+## Beta-readiness gate (before ANY other person's TV runs this)
+
+Agreed 2026-10-31 after the wedge incident: no community/Reddit
+testing until all four rungs are done.
+
+1. **SAFETY.md** - exhaustive list of everything the app and
+   `install-ipk.sh` write/patch on a TV (files, ports, luna calls,
+   boot-chain hooks) with a one-command un-do for each. Written so a
+   non-rooted stranger can audit it.
+2. **Self-torture on our panel** - >=100 connect/disconnect cycles,
+   rotation storms, app kills mid-session, 24 h soak, daemon restarts
+   under load; `snapshot.sh` diff before/after must show nothing
+   unexpected. If the app tier can wedge a TV, it happens here first.
+3. **Dev-mode-only package** - install from the tester's own dev-mode
+   session, manual start, no root, no boot-chain patch, uninstall
+   leaves nothing. Root/boot-chain install becomes explicit opt-in.
+4. **Staged rollout** - first cohort gets SAFETY.md + known-good ipk;
+   collect model/webOS matrix (which doubles as item 1's device
+   survey).
+
 ## Never wedge the TV again (rules from the 2026-10-31 incident)
 
 Blast-radius tiers for any change on a real TV:
