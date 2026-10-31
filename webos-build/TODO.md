@@ -148,6 +148,41 @@ variant and its error analysis): `webos-build/LATENCY-MEASUREMENTS.md`.
       both) beside the classic HCP mirroring - never a replacement.
       Two orthogonal axes, each with a safe default:
       `--protocol airplay1|airplay2` x `--video-out miracast-udp|smp-direct`.
+   - SMP PoC on this TV (2026-10-31, webosbrew samples `media/smp/acb`,
+     patched, built for 2.2 - sandbox `output/smp-poc/`, gitignored):
+     **the pipeline works end to end behind the screen.** Under
+     `/usr/bin/jailer -t native_devmode` the sample registers with
+     registerNativeApp, loads MSOS with `lowDelayMode:true` and zero
+     buffer ceilings, decodes 30 fps H.264 + AAC from a raw feed, and
+     logs "first picture on screen" every run; clean exit each time (no
+     ACB poisoning seen). So the "acb" ABI is reachable on LM15U/webOS
+     2.2 - nobody had proven that before.
+   - **The wall is display registration, not decode.** SMP video lands
+     on the hardware video plane *under* the UI; only an app-manager
+     launched, `transparent` foreground app gets the hole. WebAppMgr on
+     2.2 refuses every user-installed native app: dev dir, manual
+     cryptofs extract, bind-mounting the sample over dead preinstall
+     slots (`012345`, `blockbuster`; mount verified at boot via
+     `startup.sh`, guarded block still in there), `/sbin/restart
+     WebAppMgr` rescan - all "not found OR Unsupported Application
+     Type". Last resort routes are dead ends: no `sam` CLI interface,
+     no `com.lge.sam` luna category, no lshal, no PDL runtime. The
+     jailer-launched app runs but its window is unregistered: with LG's
+     `webos` SDL videodriver it is an opaque black window covering
+     everything (incl. a live mirror); `SDL_VIDEODRIVER=wayland` may
+     give ARGB, but even a transparent stray window would sit above an
+     opaque web app - the plane stays hidden without app-manager
+     hosting. Latency therefore unmeasured: **the gate stays open**
+     (decode-side behaviour suggests it should beat ~50 ms with audio -
+     no TS mux, no audio wait, no browser - but parity is possible and
+     parity is not a switch).
+   - Capture caveat for SMP: `executeOneShot` is blind to native
+     windows - pure black JPEG even when the window visibly covers the
+     mirrored picture (SCREEN and TV methods identical). An SMP leg on
+     2.2 must be photographed (webcam, two in-frame clocks) or measured
+     on a TV whose app manager hosts native apps: **next cheap try is
+     any webOS 3.5+ panel**, where Homebrew runs native apps properly
+     and the same sample should just display.
 
 2. **Packaging for others**
    - ~~Prebuilt ipk + binary~~ done (v1.1.0): the ipk bundles app + binary
@@ -179,6 +214,24 @@ variant and its error analysis): `webos-build/LATENCY-MEASUREMENTS.md`.
    - Synergy: whichever transport wins in item 1 (SMP direct feed), AP2
      becomes purely a receive-side project — decoding and display stay
      the same.
+
+4. **AirPlay visible while the TV is "off"/asleep** (deferred 2026-10-31)
+   Today a session needs the TV powered: the panel wakes itself via the
+   input-change or the app shows on wake, but mirroring to a sleeping TV
+   does nothing. Tiers, cheapest first:
+   1. Keep-awake daemon: while mirroring (and optionally always in the
+      boot chain), hold a screensaver request (`com.webos.services.
+      screensaver/registerScreenSaverRequest`) and neutralise the
+      15-minute auto-off (`com.webos.settingsservice` `autoPowerOff15Min`
+      off, restore after). `powerwatch.sh` in persist is the prototype —
+      note it does not survive reboots yet and is not in the startup
+      chain.
+   2. Wake-on-demand: iOS Shortcut on "when I start mirroring" -> SSH/
+      WoL to wake the TV (wake-tv.sh already proves WoL) then let
+      startup.sh's supervisor start the session. Costs ~15-30 s of boot.
+   3. True standby streaming (proxy): never really off; needs the panel
+      or standby power to carry video — likely not possible on LM15U,
+      park until tier 2 feels bad.
 
 ## Rotation notes
 

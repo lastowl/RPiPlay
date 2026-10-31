@@ -67,6 +67,19 @@ trap "rm -f ${once}.lock" EXIT
 touch "$once"
 log "begin (uid=$(id -u))"
 
+# --- SMP PoC: fake system app slot (guarded, remove persist/smpslot to disable) -
+# webOS 2.2 appmanager will not launch native apps from the dev/cryptofs dirs,
+# but trusts /usr/palm/applications (system, squashfs ro). /usr/palm/.../012345
+# is a dead preinstall with no appinfo.json; bind-mounting our slot over it
+# before WebAppMgr scans (this script runs at minimal-boot-done, WebAppMgr
+# starts at init-boot-done) makes the sample a system native app.
+SMP_SLOT=/usr/palm/applications/blockbuster
+if [ -f "$PERSIST/smpslot/appinfo.json" ] && ! grep -q " $SMP_SLOT " /proc/mounts 2>/dev/null; then
+    mkdir -p "$SMP_SLOT" 2>/dev/null
+    mount --bind "$PERSIST/smpslot" "$SMP_SLOT" 2>> "$LOGF" && \
+        log "smp slot bind-mounted on $SMP_SLOT" || log "smp slot mount FAILED"
+fi
+
 # --- permanent devmode flag ----------------------------------------------------
 if [ ! -d "$PREFS/devmode_enabled" ]; then
     # preserve a live token before converting file -> directory
