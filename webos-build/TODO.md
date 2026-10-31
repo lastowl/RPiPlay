@@ -271,6 +271,24 @@ variant and its error analysis): `webos-build/LATENCY-MEASUREMENTS.md`.
       or standby power to carry video — likely not possible on LM15U,
       park until tier 2 feels bad.
 
+## Never wedge the TV again (rules from the 2026-10-31 incident)
+
+Blast-radius tiers for any change on a real TV:
+
+- **App tier (safe):** ipk installs/updates, player page, rpiplay
+  binary, latency tests, logs, screenshots, WoL/reboot. Worst case:
+  restart the app. All future roadmap work (AirPlay 2, measurements,
+  packaging) lives here.
+- **OS plumbing (medium, worst case reboot):** boot chain, keep-awake,
+  sshd, dev-mode patch, settings via official luna APIs, restarting
+  LG daemons (survived repeatedly).
+- **Danger zone (worst case: LG-locked state needing factory reset or
+  firmware reinstall):** direct MSIL/VDEC work (SMP samples), system
+  bind-mounts, launchpoint/registry/sam/pdl surgery, service-menu
+  writes. NOT on a production TV: needs a spare panel or explicit
+  user sign-off plus a recovery plan (firmware version recorded, USB
+  recovery ready). `webos-build/snapshot.sh` before and after, diff.
+
 ## Rotation notes
 
 - Before the fix, rotating could leave a black screen until a later
