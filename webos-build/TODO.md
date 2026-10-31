@@ -61,6 +61,22 @@ variant and its error analysis): `webos-build/LATENCY-MEASUREMENTS.md`.
 
 ## Open issues
 
+0. **Media-pipeline wedging (observed 2026-10-31 evening)**
+   Symptom: after a session of app restarts/decoder experiments, AirPlay
+   still connects (session, app launch, `loadedmetadata`/`umsmediainfo`
+   all normal) but the player page shows the splash forever: the TV-side
+   miracast pipeline creates the media object but never binds its UDP
+   receive port (`/proc/net/udp` has no `:1388` listener; the plugin's
+   strings show a `udpSocket is NULL!` failure path), so rpiplay's
+   `TV pipeline not ready after 10s` fires and the stream never starts.
+   Ruled out overnight: the app (a stock `testFile` MP4 over HTTP stalls
+   at ~3 s with no metadata too), files, network, registry (ipk
+   reinstall), `umediaserver`/`girafficava`/`WebAppMgr` restarts, and
+   `reboot`. Kernel decoder init is clean. **Recovery: power-off at the
+   mains/ rear switch for a minute** - warm reboots do not clear it.
+   Watch item: if it recurs without heavy experimentation, this belongs
+   in user-facing docs.
+
 1. **Running on other LG TVs** (research 2026-10-28)
    - Audience: TVs without built-in AirPlay 2, i.e. 2014-2018 sets (webOS
      1.x-4.0; AirPlay 2 came with webOS 4.5 and was back-ported to some
