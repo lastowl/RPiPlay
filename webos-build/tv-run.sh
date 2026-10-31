@@ -26,6 +26,21 @@ tv() {
     ssh '/proc/1/root/bin/busybox chroot /proc/1/root /bin/sh -s'
 }
 
+# The TV sleeps (timer). If ssh is not answering, send a Wake-on-LAN magic
+# packet (needs "Mobile TV On" in the TV's network settings) and wait for
+# the boot chain - port 22 opens at boot+~5s, but auth can take until the
+# +150s sshd respawn.
+if ! ssh true >/dev/null 2>&1; then
+    echo "=== ssh to $TV not answering; sending Wake-on-LAN ==="
+    "$SCRIPT_DIR/wake-tv.sh" "$TV" >/dev/null || true
+    i=0
+    until ssh true >/dev/null 2>&1; do
+        i=$((i + 1))
+        [ $i -ge 30 ] && { echo "tv still unreachable 5 min after wake"; exit 1; }
+        sleep 10
+    done
+fi
+
 START=$APP_DIR/rpiplay-start.sh
 STARTUP=/media/developer/persist/startup.sh
 

@@ -25,6 +25,19 @@ APP_DIR=/media/developer/apps/usr/palm/applications/$APP_ID
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=8 -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedAlgorithms=+ssh-rsa -i $KEY -p 22 root@$TV"
 REMOTE=/media/developer/temp/$APP_ID.ipk
 
+# Wake the TV from standby if ssh is not answering (see wake-tv.sh; the
+# boot chain may need until +150s for the sshd respawn before auth works)
+if ! $SSH true >/dev/null 2>&1; then
+    echo "=== ssh to $TV not answering; sending Wake-on-LAN ==="
+    "$SCRIPT_DIR/wake-tv.sh" "$TV" >/dev/null || true
+    i=0
+    until $SSH true >/dev/null 2>&1; do
+        i=$((i + 1))
+        [ $i -ge 30 ] && { echo "tv still unreachable 5 min after wake"; exit 1; }
+        sleep 10
+    done
+fi
+
 echo "=== Installing $(basename "$IPK") on $TV ==="
 $SSH "cat > $REMOTE" < "$IPK"
 $SSH "cat > /media/developer/persist/startup.sh" < "$SCRIPT_DIR/startup.sh"
