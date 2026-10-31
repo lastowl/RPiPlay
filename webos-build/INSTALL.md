@@ -146,7 +146,14 @@ The TV can be powered on from the Mac with a Wake-on-LAN magic packet
 (`wake-tv.sh`; requires Settings -> Network -> *Mobile TV On*, which keeps
 the NIC live in standby). `tv-run.sh` and `install-ipk.sh` do this
 automatically when ssh is silent, so a sleeping TV is a ~40 s detour rather
-than a trip to the remote.
+than a trip to the remote. The UI sleep timer reads zero
+(`luna-send luna://com.webos.service.tv.time/setSleepTimeInfo
+'{"sleepTimeMinute":0}'`); the periodic power-offs are LG's panel-usage
+auto-off (`autoPowerOff15Min` in the Settings app), whose key no luna API
+on webOS 2.2 exposes — a root `dbus-monitor` watcher logging to
+`persist/powerwatch.log` is capturing the exact trigger for now. In the TV
+UI: General -> Timer -> *Sleep Timer* off, and if it still powers off by
+itself after ~15 min of remote inactivity, turn off the auto-off there.
 
 `rpiplay-start.sh` (installed by the ipk) handles the respawn loop and
 reads the TV's name for AirPlay discovery.

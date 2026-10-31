@@ -141,6 +141,25 @@ the difference is the delay. `RPIPLAY_NO_AUDIO=1` streams video only.
    - Clean repo layout, build instructions.
    - Remove leftovers: `gst_preload.c` unused; `HANDOVER-lite.md` partly wrong.
 
+3. **AirPlay 2 support** (added 2026-10-31 — the long-term item)
+   - We speak AirPlay 1 (Classic): fine today — iOS still mirrors over it
+     and every iPhone still has it — but Apple has been routing new
+     features (HEVC mirroring, spatial audio, lower-latency sessions)
+     through AirPlay 2 only, so the protocol ages out eventually.
+   - AirPlay 2 mirroring means: ed25519 pairing/handshake, an encrypted
+     HTTP LIVE mux stream, H.264/HEVC samples already H.264-friendly for
+     our pipeline. No MIT-licensed receiver library implements the AP2
+     mirroring subset yet; uxplay does (GPL-3) and danlflh/uxplay-webos
+     already proves it runs on webOS (webOS 3.9, 720p/30).
+   - Options: (a) a companion uxplay-based receiver packaged beside the
+     app (GPL stays in its own binary — same "study, don't copy" firewall
+     as the SMP research); (b) implement the AP2 receive layer natively
+     (large: pairing, stream, timing, and no spec); (c) track upstream
+     RPiPlay for an AP2 branch. Preferred: (a) first, (c) opportunistic.
+   - Synergy: whichever transport wins in item 1 (SMP direct feed), AP2
+     becomes purely a receive-side project — decoding and display stay
+     the same.
+
 ## Rotation notes
 
 - Before the fix, rotating could leave a black screen until a later
