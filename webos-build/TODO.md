@@ -56,6 +56,9 @@ executeOneShot` with `{"method":"SCREEN","format":"JPEG","width":1920,
 "height":1080,"path":...}` (~0.2 s each). Each capture shows both clocks;
 the difference is the delay. `RPIPLAY_NO_AUDIO=1` streams video only.
 
+Full write-up of all measurement methods (including the SMP direct-feed
+variant and its error analysis): `webos-build/LATENCY-MEASUREMENTS.md`.
+
 ## Open issues
 
 1. **Running on other LG TVs** (research 2026-10-28)
