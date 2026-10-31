@@ -139,7 +139,12 @@ the difference is the delay. `RPIPLAY_NO_AUDIO=1` streams video only.
       path (currently `miracast-udp`); the flag is documented, not
       advertised. The SMP work therefore lands as an additive backend,
       not a rewrite - and item 3 (AirPlay 2) stays orthogonal: any
-      transport feeds any backend.
+      transport feeds any backend. Same rule applies one level up: once
+      AirPlay 2 exists it joins as a **switchable protocol** (`airplay1`
+      default | `airplay2`, flag + auto-negotiate where the client offers
+      both) beside the classic HCP mirroring - never a replacement.
+      Two orthogonal axes, each with a safe default:
+      `--protocol airplay1|airplay2` x `--video-out miracast-udp|smp-direct`.
 
 2. **Packaging for others**
    - ~~Prebuilt ipk + binary~~ done (v1.1.0): the ipk bundles app + binary
