@@ -24,6 +24,17 @@
 #
 # No apostrophes anywhere - the file is pushed through ssh heredocs.
 
+# --- run in the real root filesystem ------------------------------------------
+# The start-devmode.sh hook executes inside the dev-mode jail (chroot): fine
+# for /media/developer, /var/luna and cryptofs (all bind-mounted in), but the
+# jail's /home has no root authorized_keys, so sshd started from there denies
+# our key. Detect the chroot and re-exec ourselves in the real root (same
+# trick tv-run.sh uses).
+case "$(readlink /proc/self/root 2>/dev/null)" in
+    ""|/) : ;;
+    *) exec /proc/1/root/bin/busybox chroot /proc/1/root /bin/sh "$0" "$@" ;;
+esac
+
 PERSIST=/media/developer/persist
 APP_DIR=/media/developer/apps/usr/palm/applications/com.rpiplay.airplay
 START_DEVMODE=/media/cryptofs/apps/usr/palm/services/com.palmdts.devmode.service/start-devmode.sh
