@@ -146,6 +146,24 @@ fi
 
 # Wait for a real network address (up to ~30s) so sshd binds once networking
 # is actually up; skip if something already owns port 22.
+start_sshd() {
+    # /var/run is tmpfs-mounted around minimal-boot-done and can bury
+    # a privsep dir created earlier; privsep is disabled (-o below) so the
+    # children need none, and the mkdir stays as belt and braces for the
+    # runtime-started case
+    mkdir -p /var/run/sshd
+    LD_LIBRARY_PATH="${SSHD%/*}/../lib/openssh${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+        "$SSHD" \
+        -f /dev/null \
+        -o StrictModes=no \
+        -o UsePrivilegeSeparation=no \
+        -o PermitRootLogin=yes \
+        -o PasswordAuthentication=no \
+        -o PermitUserEnvironment=yes \
+        -o UseDNS=no \
+        -h "$PERSIST/ssh_host_rsa_key" \
+        -p 22 2>> "$LOGF"
+}
 i=0
 while [ $i -lt 30 ]; do
     port22_up && break
@@ -218,11 +236,27 @@ fi
 
 log "done"
 
-# --- late hook re-check ----------------------------------------------------------
-# The Dev Mode app re-extracts a pristine start-devmode.sh shortly AFTER it has
-# run each boot (appinstalld resync). Wait past that window and re-patch, so
-# the on-disk copy is guaranteed hooked for the NEXT boot.
+# --- late maintenance -------------------------------------------------------------
+# Two known late-boot effects, both seen on real boots:
+#   1) the Dev Mode app re-extracts a pristine start-devmode.sh shortly AFTER
+#      running it -> re-patch so next boot is hooked
+#   2) a daemon spawned at boot+3s stays deaf to connections (children reset
+#      before the banner) for reasons this TV has not disclosed - daemons
+#      started once boot has settled have ALWAYS worked, including same
+#      binary/env on the same port. So: respawn sshd once after boot settles.
 (
-    sleep 120
+    sleep 150
     patch_start_devmode
+    p=$(cat /var/run/sshd.pid 2>/dev/null)
+    if [ -n "$p" ]; then
+        c=$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null)
+        case "$c" in
+            *"sshd -f /dev/null"*)
+                kill "$p" 2>/dev/null
+                log "boot sshd (pid $p) replaced by post-boot respawn"
+                sleep 2
+                port22_up || start_sshd
+                ;;
+        esac
+    fi
 ) &
