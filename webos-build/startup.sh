@@ -25,15 +25,19 @@
 # No apostrophes anywhere - the file is pushed through ssh heredocs.
 
 # --- run in the real root filesystem ------------------------------------------
-# The start-devmode.sh hook executes inside the dev-mode jail (chroot): fine
-# for /media/developer, /var/luna and cryptofs (all bind-mounted in), but the
-# jail's /home has no root authorized_keys, so sshd started from there denies
-# our key. Detect the chroot and re-exec ourselves in the real root (same
-# trick tv-run.sh uses).
-case "$(readlink /proc/self/root 2>/dev/null)" in
-    ""|/) : ;;
-    *) exec /proc/1/root/bin/busybox chroot /proc/1/root /bin/sh "$0" "$@" ;;
-esac
+# The start-devmode.sh hook executes inside the dev-mode jail (chroot). NOTE:
+# readlink /proc/self/root renders "/" even inside the chroot (procfs resolves
+# it relative to the reader), so that test never fires. Use test -ef (device +
+# inode compare done by the shell builtin): a $(stat ...) version DEADLOCKED
+# this script at boot+3s on one wake (ash waited in a pipe_wait forever on the
+# substitution's pipe - never fork anything this early over a pipe). sshd
+# authentication gets its own context-proof fix below (AuthorizedKeysFile on
+# /media, visible identically from both views); escaping merely keeps the rest
+# (supervisor, /home, /opt) in one consistent real-root view, the same idiom
+# tv-run.sh uses.
+if [ -d /proc/1/root ] && ! [ / -ef /proc/1/root ]; then
+    exec /proc/1/root/bin/busybox chroot /proc/1/root /bin/sh "$0" "$@"
+fi
 
 PERSIST=/media/developer/persist
 APP_DIR=/media/developer/apps/usr/palm/applications/com.rpiplay.airplay
@@ -152,6 +156,28 @@ start_sshd() {
     # children need none, and the mkdir stays as belt and braces for the
     # runtime-started case
     mkdir -p /var/run/sshd
+    # Host key: /media/developer is remounted with a loosened mode mask
+    # (~0775) while the Dev Mode app re-extracts mid-boot (~+2 min); sshd
+    # then refuses the "too open" host key and exits (seen live: respawn
+    # died "no hostkeys available" at +150s though the +3s start passed).
+    # Keep a 0600 copy on tmpfs - RAM is immune to LG's mount mask games;
+    # persist keeps the host identity across boots.
+    HK=/tmp/rpiplay_host_rsa_key
+    cp "$PERSIST/ssh_host_rsa_key" "$HK" 2>/dev/null && chmod 600 "$HK"
+    [ -s "$HK" ] || HK="$PERSIST/ssh_host_rsa_key"
+    # Auth keys are served from persist, NOT /home/root/.ssh: inside the
+    # dev-mode jail /home is empty, so a boot-born jailed daemon denied our
+    # key while an identical runtime one accepted it (proven both ways on
+    # port 2228: Failed -> Accepted publickey with only this option added).
+    # /media/developer is bind-mounted into the jail, so the file is the
+    # same bytes from every context. Refresh it when /home is visible.
+    AKF="$PERSIST/root_authorized_keys"
+    [ -s /home/root/.ssh/authorized_keys ] && cp /home/root/.ssh/authorized_keys "$AKF" 2>/dev/null
+    AKOPT=""
+    if [ -s "$AKF" ]; then
+        chmod 644 "$AKF" 2>/dev/null
+        AKOPT="-o AuthorizedKeysFile=$AKF"
+    fi
     LD_LIBRARY_PATH="${SSHD%/*}/../lib/openssh${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
         "$SSHD" \
         -f /dev/null \
@@ -161,7 +187,8 @@ start_sshd() {
         -o PasswordAuthentication=no \
         -o PermitUserEnvironment=yes \
         -o UseDNS=no \
-        -h "$PERSIST/ssh_host_rsa_key" \
+        $AKOPT \
+        -h "$HK" \
         -p 22 2>> "$LOGF"
 }
 i=0
@@ -177,24 +204,6 @@ if ! port22_up; then
         mkdir -p /home/root/.ssh /var/run/sshd
         chmod 700 /home/root/.ssh 2>/dev/null
         chmod 600 "$PERSIST/ssh_host_rsa_key" 2>/dev/null
-        start_sshd() {
-            # /var/run is tmpfs-mounted around minimal-boot-done and can bury
-            # a privsep dir created earlier; privsep is disabled (-o below)
-            # so the children need none, and the mkdir stays as belt and
-            # braces for the runtime-started case
-            mkdir -p /var/run/sshd
-            LD_LIBRARY_PATH="${SSHD%/*}/../lib/openssh${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
-                "$SSHD" \
-                -f /dev/null \
-                -o StrictModes=no \
-                -o UsePrivilegeSeparation=no \
-                -o PermitRootLogin=yes \
-                -o PasswordAuthentication=no \
-                -o PermitUserEnvironment=yes \
-                -o UseDNS=no \
-                -h "$PERSIST/ssh_host_rsa_key" \
-                -p 22 2>> "$LOGF"
-        }
         attempt=0
         while [ $attempt -lt 3 ]; do
             attempt=$((attempt + 1))
@@ -254,7 +263,9 @@ log "done"
             *"sshd -f /dev/null"*)
                 kill "$p" 2>/dev/null
                 log "boot sshd (pid $p) replaced by post-boot respawn"
-                sleep 2
+                # give the old daemon a moment to die AND release :22
+                i=0
+                while port22_up && [ $i -lt 4 ]; do sleep 2; i=$((i + 1)); done
                 port22_up || start_sshd
                 ;;
         esac
