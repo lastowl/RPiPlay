@@ -17,6 +17,12 @@ the JPEG shows the **composited picture including the hardware video
 plane** - verified: mirrored video and UI overlays both appear. Reads back
 over ssh (`cat /tmp/shot.jpg`).
 
+Verified again 2026-10-31 on the 49UF850V: the call returns
+`{"returnValue":true,"capturedWidth":0,"capturedHeight":0}` (the zeroes are
+normal - ignore them), the file itself lands **~1 s asynchronously** after
+the call, so poll for it rather than reading immediately. Only the original
+`path`-style argument works; `fileName`/`fileDir` is rejected.
+
 Consequence: latency = (TV-side clock shown by the overlay) - (clock shown
 by the mirrored content), read off one image. No stopwatch maths, no phone
 camera.
