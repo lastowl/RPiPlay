@@ -144,13 +144,16 @@ if ! port22_up; then
         chmod 700 /home/root/.ssh 2>/dev/null
         chmod 600 "$PERSIST/ssh_host_rsa_key" 2>/dev/null
         start_sshd() {
-            # /var/run may be tmpfs-mounted over the dir sshd made moments
-            # after minimal-boot-done - re-create it on every attempt
+            # /var/run is tmpfs-mounted around minimal-boot-done and can bury
+            # a privsep dir created earlier; privsep is disabled (-o below)
+            # so the children need none, and the mkdir stays as belt and
+            # braces for the runtime-started case
             mkdir -p /var/run/sshd
             LD_LIBRARY_PATH="${SSHD%/*}/../lib/openssh${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
                 "$SSHD" \
                 -f /dev/null \
                 -o StrictModes=no \
+                -o UsePrivilegeSeparation=no \
                 -o PermitRootLogin=yes \
                 -o PasswordAuthentication=no \
                 -o PermitUserEnvironment=yes \
