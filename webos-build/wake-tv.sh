@@ -13,7 +13,9 @@ set -e
 
 TV="${1:-192.168.50.99}"
 MAC="${2:-e8:5b:5b:99:32:14}"
-[ "$3" = "--wait" ] && WAIT=1 || WAIT=0
+WAIT=0
+for a in "$@"; do [ "$a" = "--wait" ] && WAIT=1; done
+case "$MAC" in *[!0-9a-fA-F:]*) MAC=e8:5b:5b:99:32:14 ;; esac
 
 python3 - "$MAC" "$TV" <<'PY'
 import socket, binascii, sys, time
