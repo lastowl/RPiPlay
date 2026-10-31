@@ -256,6 +256,13 @@ else
     log "no rpiplay-start.sh found - skipping"
 fi
 
+# Keep-awake watcher (TODO item 4 tier 1): forces autoPowerOff15Min off
+# every minute so the panel stops powering itself off mid-session.
+if [ -f "$PERSIST/powerwatch.sh" ]; then
+    nohup sh "$PERSIST/powerwatch.sh" >/dev/null 2>&1 &
+    log "powerwatch launched"
+fi
+
 log "done"
 
 # --- late maintenance -------------------------------------------------------------
