@@ -129,23 +129,39 @@ while [ $i -lt 30 ]; do
 done
 if ! port22_up; then
     if [ -n "$SSHD" ]; then
-        mkdir -p /home/root/.ssh
+        mkdir -p /home/root/.ssh /var/run/sshd
         chmod 700 /home/root/.ssh 2>/dev/null
         chmod 600 "$PERSIST/ssh_host_rsa_key" 2>/dev/null
-        if LD_LIBRARY_PATH="${SSHD%/*}/../lib/openssh${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
-            "$SSHD" \
-            -f /dev/null \
-            -o StrictModes=no \
-            -o PermitRootLogin=yes \
-            -o PasswordAuthentication=no \
-            -o PermitUserEnvironment=yes \
-            -o UseDNS=no \
-            -h "$PERSIST/ssh_host_rsa_key" \
-            -p 22
-        then sleep 2
-             port22_up && log "root sshd listening on port 22 ($SSHD)" || log "sshd started but NOT listening"
-        else log "sshd FAILED to start ($SSHD)"
-        fi
+        start_sshd() {
+            # /var/run may be tmpfs-mounted over the dir sshd made moments
+            # after minimal-boot-done - re-create it on every attempt
+            mkdir -p /var/run/sshd
+            LD_LIBRARY_PATH="${SSHD%/*}/../lib/openssh${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+                "$SSHD" \
+                -f /dev/null \
+                -o StrictModes=no \
+                -o PermitRootLogin=yes \
+                -o PasswordAuthentication=no \
+                -o PermitUserEnvironment=yes \
+                -o UseDNS=no \
+                -h "$PERSIST/ssh_host_rsa_key" \
+                -p 22 2>> "$LOGF"
+        }
+        attempt=0
+        while [ $attempt -lt 3 ]; do
+            attempt=$((attempt + 1))
+            if start_sshd; then
+                sleep 2
+                if port22_up; then
+                    log "root sshd listening on port 22 ($SSHD)"
+                    break
+                fi
+                log "sshd exited 0 but is NOT listening (attempt $attempt)"
+            else
+                log "sshd FAILED to start, rc=$? (attempt $attempt)"
+            fi
+            sleep 10
+        done
     else
         log "no sshd binary found - skipping"
     fi
