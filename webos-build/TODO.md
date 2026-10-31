@@ -128,6 +128,18 @@ the difference is the delay. `RPIPLAY_NO_AUDIO=1` streams video only.
      and fully measured; parity is not a reason to rewrite. Reference:
      their repo for ACB-on-2-4.x usage (GPL: study, do not copy into MIT),
      webosbrew/samples media/smp, mariotaku/ss4s.
+    - Architecture decision (2026-10-31): **keep every render path in the
+      tree, switchable at runtime** — research value for others, and
+      different generations may prefer different paths. Shape: a small
+      video-out backend interface (miracast-udp | smp-direct | future
+      lgnc), selected by `--video-out` / `RPIPLAY_VIDEO_OUT`; the SMP
+      backend dlopen()s `libplayerAPIs`/`libAcbAPI`/SDL2 so one binary
+      still runs everywhere (missing libs => the backend refuses to init,
+      never crashes the default path). Releases default to the proven
+      path (currently `miracast-udp`); the flag is documented, not
+      advertised. The SMP work therefore lands as an additive backend,
+      not a rewrite - and item 3 (AirPlay 2) stays orthogonal: any
+      transport feeds any backend.
 
 2. **Packaging for others**
    - ~~Prebuilt ipk + binary~~ done (v1.1.0): the ipk bundles app + binary
