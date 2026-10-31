@@ -69,13 +69,35 @@ variant and its error analysis): `webos-build/LATENCY-MEASUREMENTS.md`.
    receive port (`/proc/net/udp` has no `:1388` listener; the plugin's
    strings show a `udpSocket is NULL!` failure path), so rpiplay's
    `TV pipeline not ready after 10s` fires and the stream never starts.
-   Ruled out overnight: the app (a stock `testFile` MP4 over HTTP stalls
-   at ~3 s with no metadata too), files, network, registry (ipk
-   reinstall), `umediaserver`/`girafficava`/`WebAppMgr` restarts, and
-   `reboot`. Kernel decoder init is clean. **Recovery: power-off at the
-   mains/ rear switch for a minute** - warm reboots do not clear it.
-   Watch item: if it recurs without heavy experimentation, this belongs
-   in user-facing docs.
+   **Recovery: power-off at the mains/ rear switch for a minute** - warm
+   reboots do not clear it.
+   Full elimination tree (next-day forensics, all reversible/moved-aside):
+   - `gst-launch` as root OUTSIDE any jail (`filesrc ! qtdemux !
+     h264parse ! omxh264dec ! mvsink`) DECODES AND DISPLAYS FINE on the
+     wedged unit - VDEC, OMX, scaler and video plane are healthy.
+   - Yet the browser and every WAM `<video>` (both outside dev-mode)
+     stall at 0:00/no-metadata on factory MP4s: the wedge sits in the
+     SHARED MSIL session service (`msmailbox`/`miomap` host behind
+     tvservice/`/mnt/lg/lgapp/RELEASE`), not in the decoder.
+   - Ruled out one by one, by moving aside + reboot: WAM localstorage/
+     cookies, browser profile (`/mnt/lg/cache/webbrowser/chrome`),
+     `db8/mediadb` (LevelDB under /media/cryptofs/data), `secretagent`
+     (nduid regenerated), `com.palm.audio/prefsDB.sl` - the ONLY
+     persistent file modified inside the wedge window - systemprefs.db,
+     per-app gst registries, jail /dev node numbers (all consistent).
+   - Netflix.bin hidden-preload (holds msmailbox at boot+57 s): killed,
+     not the holder. QtWebProcess (Chromium media renderer): killed,
+     respawned, still stalled.
+   - Conclusion: the bad flag lives in a region only LG tooling writes
+     (factory NVM or the read-only firmware partitions) - consistent
+     with "factory reset fixes LG media-pipeline wedges" folklore.
+     If a reset does NOT fix it, next rung is USB firmware reinstall.
+   LESSON (the actual mistake): the direct-decoder (SMP/MSIL) samples
+   bypass the TV's shared media host and poke the same kernel mailbox
+   the DTV pipeline owns; that is NOT state-isolated by the sandbox -
+   it can persistently jam session provisioning for the TV's own
+   stack. Run those experiments on a disposable panel, never on the
+   production TV, or with the service-menu/firmware recovery ready.
 
 1. **Running on other LG TVs** (research 2026-10-28)
    - Audience: TVs without built-in AirPlay 2, i.e. 2014-2018 sets (webOS
