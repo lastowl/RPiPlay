@@ -105,13 +105,26 @@ and register it as a hook at the top of the dev-mode service's
 then brings up everything RPiPlay needs, and repairs the chain if LG's code
 ever resets part of it:
 
+- escapes the dev-mode **jail** (the hook runs chrooted; `test -ef` against
+  `/proc/1/root` detects it — a `$(...)` probe once deadlocked the whole
+  chain on a substitution pipe, hence the shell builtin)
 - keeps `/var/luna/preferences/devmode_enabled` a **directory** (a session
   token file gets deleted when the dev-mode session expires, and the TV then
   wipes all of `/media/developer` — a directory survives, same trick as
   mvpd-autoroot/Homebrew Channel). The real session token is preserved in
   `persist/devmode_token` and `start-devmode.sh` is pointed at it, so LG's
   own session check keeps passing
-- starts the **root sshd on port 22** (host key `persist/ssh_host_rsa_key`)
+- starts the **root sshd on port 22**. Four webOS quirks shaped this: LG
+  remounts `/media/developer` mid-boot loosening its mode mask (so sshd's
+  host key is copied to `/tmp` with 0600 — sshd refuses "too open" host
+  keys), the jail's `/home/root/.ssh` is empty (so keys come from
+  `persist/root_authorized_keys` via `AuthorizedKeysFile`, bind-mounted and
+  identical from every context), binaries mmapped off cryptofs at boot
+  execute garbage when LG remounts it (the openssh tree is copied to
+  `/tmp/openssh-run`), and a daemon born in the first minutes of boot stops
+  answering connections (one deterministic respawn at boot+150 s replaces
+  it; daemons born later have always worked). Root pubkey auth works hands-
+  off within ~1-3 minutes of power-on.
 - starts the towelroot fallback (so `prisoner@:9922` still escalates) and the
   RPiPlay supervisor
 
@@ -126,6 +139,14 @@ The older towelroot-based chain (`start-devmode.sh` hook ->
 `persist/autoroot-boot.sh` -> `boot-root.sh`) raced the exploit against boot
 and often missed; it is no longer used. If the hook is ever lost (Dev Mode
 app re-extracting its service files), the next successful boot re-injects it.
+
+### Waking the TV
+
+The TV can be powered on from the Mac with a Wake-on-LAN magic packet
+(`wake-tv.sh`; requires Settings -> Network -> *Mobile TV On*, which keeps
+the NIC live in standby). `tv-run.sh` and `install-ipk.sh` do this
+automatically when ssh is silent, so a sleeping TV is a ~40 s detour rather
+than a trip to the remote.
 
 `rpiplay-start.sh` (installed by the ipk) handles the respawn loop and
 reads the TV's name for AirPlay discovery.

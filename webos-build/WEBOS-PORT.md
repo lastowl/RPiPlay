@@ -334,10 +334,16 @@ Environment variables passed through:
 - `RPIPLAY_DUMP_DIR=/tmp/rpdump` — saves H.264 sent after each rotation
 - `RPIPLAY_ARGS="..."` — extra RPiPlay flags
 
-### Boot: `boot-root.sh` → `rpiplay-start.sh`
+### Boot: `startup.sh` → `rpiplay-start.sh`
 
-`boot-root.sh` lives in the TV's persist directory and runs at boot (after sshd
-starts). It launches `rpiplay-start.sh`, which:
+`persist/startup.sh` runs at boot as root: upstart's `/etc/init/devmode.conf`
+executes the dev-mode service's `start-devmode.sh`, where our hook sits at
+the very top. It escapes the dev-mode jail (`test / -ef /proc/1/root`),
+makes the devmode flag permanent (directory + preserved session token),
+starts the root sshd on :22 (RAM copy of openssh, `/tmp` host key, auth
+keys from persist via `AuthorizedKeysFile`, deterministic respawn at
+boot+150 s — each clause exists because a real boot broke on it), then
+launches `rpiplay-start.sh`, which:
 
 1. Kills any leftover supervisors and rpiplay instances
 2. Reads the TV's network name from `com.webos.settingsservice/getSystemSettings`
@@ -345,19 +351,24 @@ starts). It launches `rpiplay-start.sh`, which:
 3. Starts rpiplay in a respawn loop (`rpiplay -n "$name"`)
 4. Logs to `/tmp/rpiplay.log`
 
-RPiPlay is available ~3-4 minutes after power-on and auto-restarts on crash.
+RPiPlay is available within ~2 minutes of power-on and auto-restarts on
+crash. A TV in standby can be woken with a WoL magic packet
+(`wake-tv.sh`, needs "Mobile TV On").
 
 ### SSH access
 
-The TV runs sshd on port 22 (started by `boot-root.sh`). Connect with:
+The TV runs our sshd on port 22 (started by `startup.sh`; OpenSSH 6.1p1
+bundled with the dev-mode service). Connect with:
 
 ```sh
 ssh -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedAlgorithms=+ssh-rsa \
     -i ~/.ssh/uf850v_webos -p 22 root@192.168.50.99
 ```
 
-The `ssh-rsa` flags are needed because the TV's sshd is old (dropbear) and
-modern OpenSSH disables RSA by default.
+The `ssh-rsa` flags are needed because OpenSSH 6.1 only speaks ssh-rsa
+signatures and modern OpenSSH clients disable them by default. The
+prisoner shell on :9922 (LG's dev-mode sshd) still works as a fallback and
+auto-escalates via towelroot.
 
 ---
 

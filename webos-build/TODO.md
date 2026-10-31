@@ -10,8 +10,10 @@ through the TV's Miracast media pipeline (`miracast://` video source).
 - Mirroring with sound (AAC-ELD -> AAC-LC re-encode, muxed into the TS)
 - Latency stays flat (arrival-time timestamps; see `stamp()`)
 - AirPlay name follows the TV's network name (`tv-run.sh`)
-- Auto-start at boot: `boot-root.sh` launches `rpiplay-start.sh` after sshd;
-  RPiPlay comes up ~3-4 min after power-on and respawns if it crashes
+- Auto-start at boot: `startup.sh` (hooked into `start-devmode.sh` by upstart)
+  brings up root ssh on :22 (pubkey, hands-off within ~1-3 min of power-on)
+  and the RPiPlay supervisor; the TV also wakes to a Wake-on-LAN packet
+  (`wake-tv.sh`), and `tv-run.sh`/`install-ipk.sh` do that automatically
 - Rotation: the TV player can't follow a picture size change, so the app is
   relaunched (its `webOSRelaunch` handler replaces the `<video>`, always as
   1920x1080) and the cached GOP is replayed. See "Rotation notes" below.
