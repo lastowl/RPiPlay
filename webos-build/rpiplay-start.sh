@@ -8,7 +8,7 @@
 #   /proc/1/root/bin/busybox chroot /proc/1/root /bin/sh \
 #       /media/developer/apps/usr/palm/applications/com.rpiplay.airplay/rpiplay-start.sh
 #
-# Called at boot from persist/boot-root.sh and by tv-run.sh and install-ipk.sh.
+# Called at boot from persist/startup.sh and by tv-run.sh and install-ipk.sh.
 #
 # Usage: rpiplay-start.sh [stop]
 # RPIPLAY_ARGS in the environment adds RPiPlay options (e.g. -d for debug logs).
@@ -20,8 +20,8 @@ LOG=/tmp/rpiplay.log
 LOCK=/tmp/rpiplay-start.lock    # held (as a directory) by the running supervisor
 
 # Stops every supervisor and RPiPlay, not just the last one started: copies
-# left over (boot-root.sh can run more than once per boot) all advertise
-# AirPlay and fight over the player app.
+# left over from older installs or debug runs all advertise AirPlay and fight
+# over the player app.
 stop() {
     for p in /proc/[0-9]*; do
         pid=${p#/proc/}

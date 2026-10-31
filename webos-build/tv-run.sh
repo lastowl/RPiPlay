@@ -1,12 +1,12 @@
 #!/bin/sh
 # Deploy and (re)start RPiPlay on the TV.
 #
-# Uses the root sshd on port 22 started by persist/boot-root.sh, then chroots
+# Uses the root sshd on port 22 started by persist/startup.sh, then chroots
 # into pid 1's root so RPiPlay runs outside the dev-mode jail (luna-send only
 # works there). Deploys the binary, start script and app files into the
 # com.rpiplay.airplay app dir — the same layout the ipk from package-app.sh
-# installs — and keeps persist/boot-root.sh pointing at the app copy so
-# RPiPlay starts again at boot.
+# installs — and refreshes persist/startup.sh, the boot auto-start chain
+# (permanent devmode flag + root sshd + RPiPlay supervisor).
 #
 # Usage: ./webos-build/tv-run.sh [tv-ip]        (log: /tmp/rpiplay.log on the TV)
 #        ./webos-build/tv-run.sh [tv-ip] stop
@@ -16,7 +16,6 @@ TV="${1:-192.168.50.99}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 KEY="$HOME/.ssh/uf850v_webos"
 APP_DIR=/media/developer/apps/usr/palm/applications/com.rpiplay.airplay
-BOOT=/media/developer/persist/boot-root.sh
 ssh() {
     command ssh -o BatchMode=yes -o ConnectTimeout=8 \
         -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedAlgorithms=+ssh-rsa \
@@ -28,6 +27,7 @@ tv() {
 }
 
 START=$APP_DIR/rpiplay-start.sh
+STARTUP=/media/developer/persist/startup.sh
 
 if [ "$2" = "stop" ]; then
     # Either copy kills every supervisor and rpiplay; the persist one is
@@ -40,21 +40,20 @@ fi
 echo "=== Uploading binary and app to $TV ==="
 ssh "mkdir -p $APP_DIR/bin && cat > $APP_DIR/bin/rpiplay.new && chmod 755 $APP_DIR/bin/rpiplay.new" < "$SCRIPT_DIR/output/rpiplay"
 ssh "cat > $START && chmod 755 $START" < "$SCRIPT_DIR/rpiplay-start.sh"
+ssh "cat > $STARTUP && chmod 755 $STARTUP" < "$SCRIPT_DIR/startup.sh"
 COPYFILE_DISABLE=1 tar -C "$SCRIPT_DIR/app" --uid 0 --gid 0 -cf - . | ssh "tar -C $APP_DIR -xf -"
 
 echo "=== Restarting RPiPlay ==="
 tv <<EOF
-$START stop
 mv $APP_DIR/bin/rpiplay.new $APP_DIR/bin/rpiplay
-# Move off the pre-1.1 layout (binary and script lived in persist/) and keep
-# an rpiplay line in boot-root.sh pointing at the app copy
+# Move off the pre-1.1 layout (binary and script lived in persist/)
 rm -f /media/developer/persist/rpiplay /media/developer/persist/rpiplay-start.sh
-[ -f $BOOT ] || printf '#!/bin/sh\n' > $BOOT
-grep -v rpiplay-start.sh $BOOT > /tmp/boot-root.new
-cat /tmp/boot-root.new > $BOOT
-rm -f /tmp/boot-root.new
-printf '%s\n' '$START &' >> $BOOT
-chmod 755 $BOOT
+# Refresh the boot auto-start chain; it self-patches the start-devmode.sh
+# hook and may start a supervisor itself, so stop first and start below with
+# the debug environment applied
+$START stop
+$STARTUP
+$START stop
 # Debug: RPIPLAY_DUMP_DIR=/tmp/rpdump ./tv-run.sh saves the H.264 sent after each rotation
 ${RPIPLAY_DUMP_DIR:+rm -rf $RPIPLAY_DUMP_DIR; mkdir -p $RPIPLAY_DUMP_DIR; export RPIPLAY_DUMP_DIR=$RPIPLAY_DUMP_DIR}
 # Debug: RPIPLAY_NO_AUDIO=1 ./tv-run.sh streams video only (latency comparison)

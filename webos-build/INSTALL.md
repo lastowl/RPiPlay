@@ -99,17 +99,33 @@ deploys the same layout directly, without building an ipk.
 
 ### Auto-start at boot
 
-`install-ipk.sh` and `tv-run.sh` keep a line in the TV's
-`/media/developer/persist/boot-root.sh` that starts RPiPlay when the TV
-powers on, so this normally needs no setup. To do it by hand:
+`install-ipk.sh` and `tv-run.sh` install `/media/developer/persist/startup.sh`
+and register it as a hook at the top of the dev-mode service's
+`start-devmode.sh`, which upstart runs as root on every boot. `startup.sh`
+then brings up everything RPiPlay needs, and repairs the chain if LG's code
+ever resets part of it:
+
+- keeps `/var/luna/preferences/devmode_enabled` a **directory** (a session
+  token file gets deleted when the dev-mode session expires, and the TV then
+  wipes all of `/media/developer` — a directory survives, same trick as
+  mvpd-autoroot/Homebrew Channel). The real session token is preserved in
+  `persist/devmode_token` and `start-devmode.sh` is pointed at it, so LG's
+  own session check keeps passing
+- starts the **root sshd on port 22** (host key `persist/ssh_host_rsa_key`)
+- starts the towelroot fallback (so `prisoner@:9922` still escalates) and the
+  RPiPlay supervisor
+
+It is flock-guarded once-per-boot and safe to re-run at any time:
 
 ```sh
-ssh <tv> # (with the flags above)
-cat >> /media/developer/persist/boot-root.sh << 'BOOT'
-/media/developer/apps/usr/palm/applications/com.rpiplay.airplay/rpiplay-start.sh &
-BOOT
-chmod 755 /media/developer/persist/boot-root.sh
+ssh <tv> /proc/1/root/bin/busybox chroot /proc/1/root \
+    /media/developer/persist/startup.sh
 ```
+
+The older towelroot-based chain (`start-devmode.sh` hook ->
+`persist/autoroot-boot.sh` -> `boot-root.sh`) raced the exploit against boot
+and often missed; it is no longer used. If the hook is ever lost (Dev Mode
+app re-extracting its service files), the next successful boot re-injects it.
 
 `rpiplay-start.sh` (installed by the ipk) handles the respawn loop and
 reads the TV's name for AirPlay discovery.

@@ -4,8 +4,10 @@
 #   1. installs the package through appinstalld (dev-mode install)
 #   2. makes the bundled binary and start script executable (appinstalld may
 #      strip the exec bits when extracting)
-#   3. points persist/boot-root.sh at the start script so RPiPlay autostarts
-#      at boot (creates the file if it isn't there yet)
+#   3. installs persist/startup.sh (the boot auto-start chain: permanent
+#      devmode flag, root sshd, RPiPlay supervisor) and runs it once - it
+#      self-patches the start-devmode.sh boot hook, so it also repairs older
+#      installs that used the towelroot-based boot-root.sh chain
 #   4. removes leftovers of the pre-1.1 layout (binary and script in persist/)
 #   5. starts RPiPlay now
 #
@@ -17,14 +19,15 @@ TV=${2:-192.168.50.99}
 KEY=${3:-$HOME/.ssh/uf850v_webos}
 [ -f "$IPK" ] || { echo "usage: $0 <file.ipk> [tv-ip] [ssh-key]"; exit 1; }
 
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 APP_ID=com.rpiplay.airplay
 APP_DIR=/media/developer/apps/usr/palm/applications/$APP_ID
-BOOT=/media/developer/persist/boot-root.sh
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=8 -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedAlgorithms=+ssh-rsa -i $KEY -p 22 root@$TV"
 REMOTE=/media/developer/temp/$APP_ID.ipk
 
 echo "=== Installing $(basename "$IPK") on $TV ==="
 $SSH "cat > $REMOTE" < "$IPK"
+$SSH "cat > /media/developer/persist/startup.sh" < "$SCRIPT_DIR/startup.sh"
 $SSH '/proc/1/root/bin/busybox chroot /proc/1/root /bin/sh -s' <<EOF
 luna-send -n 1 -w 3000 luna://com.webos.applicationManager/closeByAppId '{"id":"$APP_ID"}' < /dev/null > /dev/null 2>&1
 # Kill any supervisor regardless of where its copy lives (the new app files
@@ -51,14 +54,11 @@ rm -f $REMOTE
 chmod 755 $APP_DIR/rpiplay-start.sh $APP_DIR/bin/rpiplay 2>/dev/null
 chmod 755 $APP_DIR
 
-# Autostart at boot: keep an rpiplay line in boot-root.sh pointing at the app
-# copy (replacing an older one wherever it came from)
-[ -f $BOOT ] || printf '#!/bin/sh\n' > $BOOT
-grep -v rpiplay-start.sh $BOOT > /tmp/boot-root.new
-cat /tmp/boot-root.new > $BOOT
-rm -f /tmp/boot-root.new
-printf '%s\n' '$APP_DIR/rpiplay-start.sh &' >> $BOOT
-chmod 755 $BOOT
+# Boot auto-start: install and exercise the startup chain. It converts the
+# devmode flag to a permanent directory, patches the start-devmode.sh hook,
+# ensures root sshd and the supervisor, and is once-per-boot guarded itself.
+chmod 755 /media/developer/persist/startup.sh
+/media/developer/persist/startup.sh
 
 # Pre-1.1 layout had the binary and script in persist/
 rm -f /media/developer/persist/rpiplay /media/developer/persist/rpiplay-start.sh
