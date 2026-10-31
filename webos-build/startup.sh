@@ -29,10 +29,15 @@ APP_DIR=/media/developer/apps/usr/palm/applications/com.rpiplay.airplay
 START_DEVMODE=/media/cryptofs/apps/usr/palm/services/com.palmdts.devmode.service/start-devmode.sh
 PREFS=/var/luna/preferences
 TOKEN_FILE=$PREFS/devmode_enabled/token
-LOGF=/tmp/autoroot.log
+LOGF=/tmp/rpiplay-startup.log
 
 log() {
     echo "$(date) startup: $*" >> "$LOGF"
+}
+
+# Exact port-22 listener check ("grep :22" also matches :9922).
+port22_up() {
+    netstat -tln 2>/dev/null | awk '{print $4}' | grep -Eq '[:.]22$'
 }
 
 # --- once per boot, and never twice at once ----------------------------------
@@ -72,7 +77,8 @@ fi
 rm -f "$PREFS"/dc* 2>/dev/null    # devmode reboot/session counters
 
 # --- patch + self-heal start-devmode.sh ---------------------------------------
-if [ -f "$START_DEVMODE" ]; then
+patch_start_devmode() {
+    [ -f "$START_DEVMODE" ] || return 0
     # a) old towelroot-era hook block -> new one; add it when absent
     if ! grep -q "RPIPLAY BOOT HOOK" "$START_DEVMODE" 2>/dev/null; then
         sed -i "/=== AUTOROOT BOOT HOOK ===/,/=== END AUTOROOT ===/d" \
@@ -95,33 +101,53 @@ LD_PRELOAD="" nohup /media/developer/persist/startup.sh > /dev/null 2>\&1 < /dev
             "$START_DEVMODE" 2>/dev/null
         log "session check pointed at persist/devmode_token"
     }
-fi
+    return 0
+}
+patch_start_devmode
 
 # --- root sshd on port 22 -------------------------------------------------------
+# /opt/openssh only exists inside the dev-mode jail; in the real rootfs the
+# sshd binary ships with the devmode service (mmcblk0p47, mounted ro) and
+# needs its bundled libs on LD_LIBRARY_PATH.
+SSHD=""
+for cand in /opt/openssh/sbin/sshd \
+    /media/cryptofs/apps/usr/palm/services/com.palmdts.devmode.service/binaries-armv71/opt/openssh/sbin/sshd \
+    /media/cryptofs/apps/usr/palm/services/com.palmdts.devmode.service/binaries-i686/opt/openssh/sbin/sshd
+do
+    [ -x "$cand" ] && { SSHD=$cand; break; }
+done
+
 # Wait for a real network address (up to ~30s) so sshd binds once networking
 # is actually up; skip if something already owns port 22.
 i=0
 while [ $i -lt 30 ]; do
-    netstat -tln 2>/dev/null | grep -q ":22 " && break
+    port22_up && break
     n=$(ifconfig -a 2>/dev/null | grep "inet addr:" | grep -vc "addr:127\.\|addr:169\.254\.")
     [ "${n:-0}" -ge 1 ] && break
     sleep 1
     i=$((i + 1))
 done
-if ! netstat -tln 2>/dev/null | grep -q ":22 "; then
-    mkdir -p /home/root/.ssh
-    chmod 700 /home/root/.ssh 2>/dev/null
-    chmod 600 "$PERSIST/ssh_host_rsa_key" 2>/dev/null
-    if /opt/openssh/sbin/sshd \
-        -o StrictModes=no \
-        -o PermitRootLogin=yes \
-        -o PasswordAuthentication=no \
-        -o PermitUserEnvironment=yes \
-        -o UseDNS=no \
-        -h "$PERSIST/ssh_host_rsa_key" \
-        -p 22
-    then log "root sshd started on port 22"
-    else log "sshd FAILED to start"
+if ! port22_up; then
+    if [ -n "$SSHD" ]; then
+        mkdir -p /home/root/.ssh
+        chmod 700 /home/root/.ssh 2>/dev/null
+        chmod 600 "$PERSIST/ssh_host_rsa_key" 2>/dev/null
+        if LD_LIBRARY_PATH="${SSHD%/*}/../lib/openssh${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+            "$SSHD" \
+            -f /dev/null \
+            -o StrictModes=no \
+            -o PermitRootLogin=yes \
+            -o PasswordAuthentication=no \
+            -o PermitUserEnvironment=yes \
+            -o UseDNS=no \
+            -h "$PERSIST/ssh_host_rsa_key" \
+            -p 22
+        then sleep 2
+             port22_up && log "root sshd listening on port 22 ($SSHD)" || log "sshd started but NOT listening"
+        else log "sshd FAILED to start ($SSHD)"
+        fi
+    else
+        log "no sshd binary found - skipping"
     fi
 else
     log "port 22 already in use, skipping sshd"
@@ -145,3 +171,12 @@ else
 fi
 
 log "done"
+
+# --- late hook re-check ----------------------------------------------------------
+# The Dev Mode app re-extracts a pristine start-devmode.sh shortly AFTER it has
+# run each boot (appinstalld resync). Wait past that window and re-patch, so
+# the on-disk copy is guaranteed hooked for the NEXT boot.
+(
+    sleep 120
+    patch_start_devmode
+) &
